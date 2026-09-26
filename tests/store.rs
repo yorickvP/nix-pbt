@@ -624,6 +624,10 @@ fn hash_string(tc: TestCase) {
 /// `convertHash` between the hash formats (differential: Lix lacks it).
 #[hegel::test]
 fn convert_hash(tc: TestCase) {
+    // Lix and fix don't have `convertHash`.
+    if is_skipped("convert-hash") {
+        return;
+    }
     let algo = tc.draw(gs::sampled_from(vec!["md5", "sha1", "sha256", "sha512"]));
     let s = tc.draw(nix_strings());
     let to = tc.draw(gs::sampled_from(vec![
@@ -640,4 +644,63 @@ fn convert_hash(tc: TestCase) {
         &format!("builtins.convertHash {{ {hash_attr} toHashFormat = \"{to}\"; }}"),
         Expect::Unspecified,
     );
+}
+
+/// A store operation that fails doesn't break the ones after it, in the same
+/// session. Each sequence runs in a new session of every evaluator.
+#[test]
+fn store_errors_dont_poison_the_session() {
+    let id = std::process::id();
+    let mut sequences: Vec<(&str, Vec<(String, Expect)>)> = Vec::new();
+    // fix: after the daemon rejects a write, later writes fail with
+    // `WriteFailed` or with the earlier write's error.
+    if !is_skipped("store-write-desync") {
+        let mut seq = vec![("builtins.toFile \"..-x\" \"\"".to_string(), Expect::Error)];
+        for i in 0..4 {
+            let (name, contents) = (format!("ok-{id}-{i}"), format!("{i}"));
+            seq.push((
+                format!("builtins.toFile \"{name}\" \"{contents}\""),
+                Expect::value(store::text_path(&name, contents.as_bytes(), &[])),
+            ));
+        }
+        sequences.push(("store-write-desync", seq));
+    }
+    // Lix main: after copying a missing path fails, the next copy segfaults.
+    if !is_skipped("failed-copy-crash") {
+        let file = format!("{}/servers/nix-capi/server.c", env!("CARGO_MANIFEST_DIR"));
+        sequences.push((
+            "failed-copy-crash",
+            vec![
+                ("\"${/nix-pbt-missing}\"".to_string(), Expect::Error),
+                (
+                    format!("builtins.hashFile \"sha256\" \"${{{file}}}\""),
+                    Expect::value(sha256_hex(&std::fs::read(&file).unwrap())),
+                ),
+            ],
+        ));
+    }
+    let mut failures = Vec::new();
+    for ev in evaluators() {
+        for (tag, seq) in &sequences {
+            let exprs: Vec<&str> = seq.iter().map(|(e, _)| e.as_str()).collect();
+            let outs = ev.eval_in_new_session(&exprs);
+            let ok = seq
+                .iter()
+                .zip(&outs)
+                .all(|((_, want), got)| match (want, got) {
+                    (Expect::Error, Outcome::Error(_)) => true,
+                    (Expect::Value(w), Outcome::Value(g)) => w == g,
+                    _ => false,
+                });
+            if !ok {
+                let steps: Vec<String> = exprs
+                    .iter()
+                    .zip(&outs)
+                    .map(|(e, o)| format!("  {e}\n    => {}", o.describe()))
+                    .collect();
+                failures.push(format!("{} ({tag}):\n{}", ev.name, steps.join("\n")));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }

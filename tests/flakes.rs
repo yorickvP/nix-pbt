@@ -107,7 +107,7 @@ struct FlakeDir {
 impl FlakeDir {
     fn create(g: &Graph) -> FlakeDir {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let base = std::env::temp_dir().join(format!(
+        let base = tmp_dir().join(format!(
             "nix-pbt-flakes-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -434,10 +434,30 @@ fn lock_files_are_interchangeable(tc: TestCase) {
         return;
     }
     let g = tc.draw(graphs());
+    let locked = lock(&g);
     let expect = model(&g);
     tc.note(&format!("model: {expect:?}"));
     if matches!(&expect, Err(e) if e.starts_with("circular import")) {
         skip_known(&tc, "circular-import");
+    }
+    // An input `path:<base>/f0` is the root flake's own directory, whose
+    // hash changes when the lock file is written. CppNix and Lix accept the
+    // lock file anyway; fix reports a NAR hash mismatch.
+    fn refers_to_root(d: &InputDecl) -> bool {
+        matches!(d.spec, Spec::Url(0)) || d.overrides.values().any(refers_to_root)
+    }
+    if g.flakes.iter().flat_map(|f| f.values()).any(refers_to_root) {
+        skip_known(&tc, "root-input-hash");
+    }
+    // Lix writes the declared ref as the `original` of an input that an
+    // override replaced with a URL; CppNix and fix write the override.
+    fn overrides_url(d: &InputDecl) -> bool {
+        d.overrides
+            .values()
+            .any(|o| matches!(o.spec, Spec::Url(_)) || overrides_url(o))
+    }
+    if g.flakes.iter().flat_map(|f| f.values()).any(overrides_url) {
+        skip_known(&tc, "override-original");
     }
     // `fix flake lock` doesn't do LockFile::check: it writes lock files with
     // follow cycles and follows to non-existent inputs.
@@ -454,11 +474,20 @@ fn lock_files_are_interchangeable(tc: TestCase) {
         let _ = std::fs::remove_file(&lock_file);
         let (ok, stderr) = locker.run_in(&root);
         set_dir_readonly(&root, true);
-        match (&expect, ok) {
+        // Locking checks the graph; an infinite recursion only shows up
+        // when evaluating it.
+        match (&locked, ok) {
             (Ok(_), true) => {}
             (Err(_), false) => continue,
-            (Ok(v), false) => panic!(
-                "{} failed to lock a valid graph (model: {v}):\n{stderr}",
+            // Lix follows a `follows` that an input override replaced, and
+            // overflows the stack.
+            (Ok(_), false)
+                if stderr.contains("stack overflow") && is_skipped("override-follows") =>
+            {
+                tc.assume(false)
+            }
+            (Ok(_), false) => panic!(
+                "{} failed to lock a valid graph (model: {expect:?}):\n{stderr}",
                 locker.name
             ),
             (Err(e), true) => panic!("{} locked an invalid graph (model: {e})", locker.name),
