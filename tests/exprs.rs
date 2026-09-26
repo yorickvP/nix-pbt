@@ -383,3 +383,30 @@ fn unused_throws_are_not_forced(tc: TestCase) {
     };
     check(&wrapped, expect);
 }
+
+/// Error kinds: `tryEval` catches `throw` and failed assertions but not,
+/// say, division by zero, so wrapping an expression in it tells the two
+/// apart. (Plain differential checks only compare whether an error
+/// happened.)
+///
+/// With several errors in one expression, which one wins depends on
+/// evaluation order, which differs: `substring (-1) (throw "x") ""` checks
+/// the start before forcing the length in CppNix, not in fix. `builtins.rs`
+/// separates those; `NIX_PBT_SKIP=error-order` skips this property.
+#[hegel::test]
+fn error_kinds_agree(tc: TestCase) {
+    if is_skipped("error-order") {
+        return;
+    }
+    let expr = tc.draw(exprs());
+    let out = check(
+        &format!("let r = builtins.tryEval (builtins.deepSeq ({expr}) true); in r.success"),
+        Expect::Unspecified,
+    );
+    tc.event(match out {
+        Outcome::Value(serde_json::Value::Bool(true)) => "value",
+        Outcome::Value(_) => "caught",
+        Outcome::Error(_) => "uncatchable",
+        _ => "other",
+    });
+}
