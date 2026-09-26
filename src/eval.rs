@@ -33,15 +33,15 @@
 //!   See `servers/nix-capi` for an implementation on the CppNix C API.
 //!
 //! Sessions of the long-lived modes are pooled per evaluator (one per
-//! concurrently running test) and restarted after a crash, a timeout, or
-//! [`RECYCLE_AFTER`] evaluations.
+//! concurrently running test, at most `NIX_PBT_MAX_SESSIONS`) and restarted
+//! after a crash, a timeout, or [`RECYCLE_AFTER`] evaluations.
 
 use serde_json::Value as Json;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
@@ -62,7 +62,14 @@ pub struct Evaluator {
     pub name: String,
     pub mode: Mode,
     pub argv: Vec<String>,
-    sessions: Mutex<Vec<Session>>,
+    pool: Mutex<Pool>,
+    returned: Condvar,
+}
+
+/// Idle sessions, and how many exist in total (idle or in use).
+struct Pool {
+    idle: Vec<Session>,
+    live: usize,
 }
 
 impl std::fmt::Debug for Evaluator {
@@ -97,7 +104,11 @@ impl Evaluator {
             name: name.trim().to_string(),
             mode,
             argv,
-            sessions: Mutex::new(Vec::new()),
+            pool: Mutex::new(Pool {
+                idle: Vec::new(),
+                live: 0,
+            }),
+            returned: Condvar::new(),
         }
     }
 
@@ -106,20 +117,51 @@ impl Evaluator {
         if self.mode == Mode::Exec {
             return exec_once(self, expr);
         }
-        let pooled = self.sessions.lock().unwrap().pop();
-        let mut session = match pooled {
-            Some(s) => s,
-            None => Session::spawn(self),
-        };
-        let out = match self.mode {
-            Mode::Repl => session.eval_repl(expr),
-            Mode::Server => session.eval_server(expr),
-            Mode::Exec => unreachable!(),
-        };
-        if session.healthy && session.evals < RECYCLE_AFTER {
-            self.sessions.lock().unwrap().push(session);
+        let mut session = self.checkout();
+        let out = session.eval(self.mode, expr);
+        // fix's daemon connection gets out of sync after the daemon rejects
+        // a write (see `store::store_errors_dont_poison_the_session`); start
+        // afresh rather than let that spill into other tests.
+        if matches!(&out, Outcome::Error(e) if e.contains("error: daemon:"))
+            && crate::is_skipped("store-write-desync")
+        {
+            session.healthy = false;
         }
+        let mut pool = self.pool.lock().unwrap();
+        if session.healthy && session.evals < RECYCLE_AFTER {
+            pool.idle.push(session);
+        } else {
+            pool.live -= 1;
+        }
+        self.returned.notify_one();
         out
+    }
+
+    /// Evaluate `exprs` one after the other in a new session of its own, for
+    /// properties about state that carries over between evaluations.
+    pub fn eval_in_new_session(&self, exprs: &[&str]) -> Vec<Outcome> {
+        if self.mode == Mode::Exec {
+            return exprs.iter().map(|e| exec_once(self, e)).collect();
+        }
+        let mut session = Session::spawn(self);
+        exprs.iter().map(|e| session.eval(self.mode, e)).collect()
+    }
+
+    /// An idle session, a new one, or (at `NIX_PBT_MAX_SESSIONS`) the next
+    /// one to be returned.
+    fn checkout(&self) -> Session {
+        let mut pool = self.pool.lock().unwrap();
+        loop {
+            if let Some(s) = pool.idle.pop() {
+                return s;
+            }
+            if pool.live < max_sessions() {
+                pool.live += 1;
+                drop(pool);
+                return Session::spawn(self);
+            }
+            pool = self.returned.wait(pool).unwrap();
+        }
     }
 
     fn command(&self) -> Command {
@@ -149,6 +191,18 @@ pub fn evaluators() -> &'static [Evaluator] {
             .collect();
         assert!(!evs.is_empty(), "NIX_PBT_EVALUATORS lists no evaluators");
         evs
+    })
+}
+
+/// `NIX_PBT_MAX_SESSIONS`: how many sessions of one evaluator may run at
+/// once (default: unlimited, i.e. one per test thread).
+fn max_sessions() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("NIX_PBT_MAX_SESSIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(usize::MAX)
     })
 }
 
@@ -438,6 +492,14 @@ impl Session {
         }
     }
 
+    fn eval(&mut self, mode: Mode, expr: &str) -> Outcome {
+        match mode {
+            Mode::Repl => self.eval_repl(expr),
+            Mode::Server => self.eval_server(expr),
+            Mode::Exec => unreachable!(),
+        }
+    }
+
     /// Mark the session dead and describe why.
     fn fail(&mut self, err: ReadErr) -> Outcome {
         self.healthy = false;
@@ -521,6 +583,10 @@ impl Session {
             !expr.contains('\n'),
             "repl mode needs single-line expressions: {expr:?}"
         );
+        // Lix ≥ 2.96 applies backspaces in its input, even from a pipe.
+        // Generated expressions only contain raw control characters inside
+        // string literals, where an interpolation means the same thing.
+        let expr = expr.replace('\u{8}', r#"${builtins.fromJSON "\"\\b\""}"#);
         self.evals += 1;
         let deadline = Instant::now() + timeout();
         let nonce = format!(
@@ -539,11 +605,12 @@ impl Session {
             match self.stdout.read_line(deadline) {
                 Ok(line) => {
                     let line = strip_ansi(&String::from_utf8_lossy(&line));
+                    let line = strip_prompts(&line);
                     // The sentinel is normally a line of its own, but don't
                     // rely on the previous output ending in a newline.
                     let (line, done) = match line.find(&value_end) {
                         Some(i) => (&line[..i], true),
-                        None => (&line[..], false),
+                        None => (line, false),
                     };
                     if !line.trim().is_empty() {
                         values.push(line.trim().to_string());
@@ -589,6 +656,16 @@ impl Session {
             _ => Outcome::Unparseable(values.join("\n")),
         }
     }
+}
+
+/// Remove REPL prompts from the start of an output line. Lix ≥ 2.96 prints
+/// `nix-repl> ` to stdout when `TERM=dumb`, even if stdin isn't a terminal.
+fn strip_prompts(mut line: &str) -> &str {
+    const PROMPTS: &[&str] = &["nix-repl> ", "nix-repl>"];
+    while let Some(rest) = PROMPTS.iter().find_map(|p| line.strip_prefix(p)) {
+        line = rest;
+    }
+    line
 }
 
 /// Decode a string literal as printed by a REPL: either Nix syntax (`\"`,
@@ -648,6 +725,13 @@ mod tests {
     #[test]
     fn ansi() {
         assert_eq!(strip_ansi("\x1b[35;1m\"3\"\x1b[0m"), "\"3\"");
+    }
+
+    #[test]
+    fn prompts() {
+        assert_eq!(strip_prompts("nix-repl> nix-repl> \"1\""), "\"1\"");
+        assert_eq!(strip_prompts("nix-repl>"), "");
+        assert_eq!(strip_prompts("\"nix-repl> \""), "\"nix-repl> \"");
     }
 
     #[test]

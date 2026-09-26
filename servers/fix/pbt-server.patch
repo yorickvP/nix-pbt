@@ -1,0 +1,143 @@
+diff --git a/src/cli/args.zig b/src/cli/args.zig
+index 68d23925..48d80358 100644
+--- a/src/cli/args.zig
++++ b/src/cli/args.zig
+@@ -149,6 +149,9 @@ pub const Options = struct {
+     /// render `:debug` and `:vm` through their line-oriented interfaces rather
+     /// than entering an alternate-screen workspace.
+     no_tui: bool = false,
++    /// `fix repl --pbt-server`: speak the nix-pbt evaluation protocol on
++    /// stdin/stdout (see `repl/pbt_server.zig`).
++    pbt_server: bool = false,
+     show_trace: bool = false,
+     /// Drop into the interactive debug console at `builtins.break` (and, later,
+     /// on evaluation errors). Forces single-worker, speculation-free evaluation
+@@ -368,6 +371,7 @@ pub const Opt = enum {
+     help,
+     // Repl.
+     no_tui,
++    pbt_server,
+     // Shell.
+     packages,
+     // Switch.
+@@ -545,6 +549,7 @@ const specs = [_]Spec{
+ 
+     .{ .id = .no_tui, .long = "--no-tui", .help = "keep the interactive editor, but show :debug and :vm\nwithout an alternate-screen TUI", .show_in = &.{.repl} },
+     .{ .id = .no_tui, .long = "--bare", .show_in = &.{.repl}, .hidden = true }, // compatibility alias
++    .{ .id = .pbt_server, .long = "--pbt-server", .help = "serve the nix-pbt evaluation protocol on stdin/stdout", .show_in = &.{.repl}, .hidden = true },
+ 
+     .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .multi, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell}, .complete = .{ .package, .none } },
+ 
+diff --git a/src/cli/args/apply.zig b/src/cli/args/apply.zig
+index 89aa27a4..3621f5a2 100644
+--- a/src/cli/args/apply.zig
++++ b/src/cli/args/apply.zig
+@@ -86,6 +86,7 @@ pub fn apply(
+         .hugetlb => options.hugetlb = hugetlb.parseMode(v0.?) orelse return error.InvalidHugetlbMode,
+         .help => return error.Help,
+         .no_tui => options.no_tui = true,
++        .pbt_server => options.pbt_server = true,
+         .packages => unreachable,
+         .nixos => options.switch_target = .nixos,
+         .darwin => options.switch_target = .darwin,
+diff --git a/src/cli/repl/command.zig b/src/cli/repl/command.zig
+index 99e73b71..814f79f6 100644
+--- a/src/cli/repl/command.zig
++++ b/src/cli/repl/command.zig
+@@ -41,6 +41,7 @@ const vm_ui = @import("vm/root.zig");
+ const vm_plain = @import("vm/plain.zig");
+ const vm_query_cache = @import("vm/query_cache.zig");
+ const transcript_mod = @import("transcript.zig");
++const pbt_server = @import("pbt_server.zig");
+ 
+ const Options = args.Options;
+ const Engine = engine.Engine;
+@@ -123,7 +124,9 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
+         if (tui_enabled) vm_debugger.install(&ev) else console.install(&ev);
+     }
+ 
+-    if (interactive) {
++    if (options.pbt_server) {
++        try pbt_server.run(allocator, init.io, &ev, options.show_trace);
++    } else if (interactive) {
+         try repl.runInteractive();
+     } else {
+         try repl.runBare(stdin_tty);
+diff --git a/src/cli/repl/pbt_server.zig b/src/cli/repl/pbt_server.zig
+new file mode 100644
+index 00000000..71f2cdee
+--- /dev/null
++++ b/src/cli/repl/pbt_server.zig
+@@ -0,0 +1,72 @@
++//! `fix repl --pbt-server`: serve the nix-pbt evaluation protocol on
++//! stdin/stdout instead of a REPL.
++//!
++//!   request:  <byte length>\n<expression>
++//!   response: ok <byte length>\n<JSON value>
++//!          |  error <byte length>\n<error message>
++//!
++//! Each expression is evaluated like `fix eval --read-write-mode --strict
++//! --json -E`: relative paths resolve against the working directory, and
++//! nothing is bound between requests. See https://github.com/yorickvP/nix-pbt.
++
++const std = @import("std");
++const engine = @import("expr");
++const render = @import("../render.zig");
++
++const Engine = engine.Engine;
++
++/// Reclaim the previous requests' garbage every this many requests. The repl
++/// collects after every input, which dominates the cost of tiny ones.
++const collect_every = 64;
++
++pub fn run(allocator: std.mem.Allocator, io: std.Io, ev: *Engine, show_trace: bool) !void {
++    // One daemon connection instead of a pool of 8 per process: requests are
++    // served one at a time, and test suites run many servers at once.
++    ev.store.daemon_runtime.pool_workers = 1;
++    // Like `nix repl` (and the CppNix server): derivations and sources are
++    // written to the store, so their paths are the real ones.
++    ev.setParallelismToggles(true, true);
++    ev.enableReadWriteEvaluation();
++
++    var stdin_buffer: [64 * 1024]u8 = undefined;
++    var stdin = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
++    var stdout_buffer: [64 * 1024]u8 = undefined;
++    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
++
++    var body: std.Io.Writer.Allocating = .init(allocator);
++    defer body.deinit();
++    var served: usize = 0;
++    while (try stdin.interface.takeDelimiter('\n')) |header| {
++        const len = std.fmt.parseInt(usize, header, 10) catch return error.BadRequest;
++        const source = try allocator.alloc(u8, len);
++        defer allocator.free(source);
++        try stdin.interface.readSliceAll(source);
++
++        body.clearRetainingCapacity();
++        const ok = evaluate(ev, &body, source, show_trace);
++        try stdout.interface.print("{s} {d}\n", .{ if (ok) "ok" else "error", body.written().len });
++        try stdout.interface.writeAll(body.written());
++        try stdout.interface.flush();
++
++        served += 1;
++        if (served % collect_every == 0) _ = ev.collectMajorNow();
++    }
++}
++
++/// Write the strict value as JSON to `out`, or the error report if that
++/// fails. Returns whether it succeeded.
++fn evaluate(ev: *Engine, out: *std.Io.Writer.Allocating, source: []const u8, show_trace: bool) bool {
++    const value = ev.evaluate(source) catch |err| {
++        render.evalFailureTo(&out.writer, false, show_trace, ev, source, err) catch {};
++        return false;
++    };
++    const err = blk: {
++        ev.forceDeep(value) catch |err| break :blk err;
++        ev.writeJsonValue(&out.writer, value) catch |err| break :blk err;
++        return true;
++    };
++    // Drop any partially written JSON.
++    out.clearRetainingCapacity();
++    render.evaluationErrorTo(&out.writer, false, show_trace, ev, source, err) catch {};
++    return false;
++}

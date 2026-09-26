@@ -59,6 +59,7 @@ pub fn check(expr: &str, expect: impl Into<Expect>) -> Outcome {
     let expect = expect.into();
     let evs = evaluators();
     let outcomes = eval::eval_all(evs, expr);
+    log(evs, expr, &outcomes);
 
     let mut problems = Vec::new();
     let reference = &outcomes[0];
@@ -151,6 +152,15 @@ pub fn is_skipped(tag: &str) -> bool {
     skip.split(',').any(|t| t.trim() == tag)
 }
 
+/// Where tests create files (generated flakes, file trees): `NIX_PBT_TMPDIR`,
+/// or the system temporary directory. nix-shell deletes its `TMPDIR` on
+/// exit, so set this to keep the trees of failing tests around.
+pub fn tmp_dir() -> std::path::PathBuf {
+    std::env::var_os("NIX_PBT_TMPDIR")
+        .map(Into::into)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// Shorthand for a law expressed in Nix: `expr` must evaluate to `true`.
 pub fn check_true(expr: &str) {
     check(expr, Expect::value(true));
@@ -163,6 +173,32 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// Append every evaluation to the file named by `NIX_PBT_LOG`, as JSON
+/// lines `{"expr": ..., "<evaluator>": "<outcome>", ...}`. Useful to find
+/// what made Hegel report a flaky test.
+fn log(evs: &[Evaluator], expr: &str, outcomes: &[Outcome]) {
+    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let file = LOG.get_or_init(|| {
+        let path = std::env::var_os("NIX_PBT_LOG")?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("NIX_PBT_LOG: {e}"));
+        Some(std::sync::Mutex::new(file))
+    });
+    if let Some(file) = file {
+        let mut entry = serde_json::Map::new();
+        entry.insert("expr".into(), expr.into());
+        for (ev, out) in evs.iter().zip(outcomes) {
+            entry.insert(ev.name.clone(), out.describe().into());
+        }
+        use std::io::Write as _;
+        let _ = writeln!(file.lock().unwrap(), "{}", Json::Object(entry));
+    }
 }
 
 fn describe_expect(e: &Expect) -> String {
