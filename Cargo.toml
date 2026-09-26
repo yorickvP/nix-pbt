@@ -1,0 +1,19 @@
+[package]
+name = "nix-pbt"
+version = "0.1.0"
+edition = "2024"
+description = "Property-based and differential tests for Nix builtins, using Hegel"
+
+[dependencies]
+hegeltest = { version = "0.47", features = ["static-engine"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
+shell-words = "1"
+wait-timeout = "0.2"
+
+# The Hegel engine is a dependency; debug builds of it make test-case
+# generation, not evaluation, the bottleneck.
+[profile.dev.package."*"]
+opt-level = 3
