@@ -103,9 +103,15 @@ server needed, ~100× slower).
   `fix repl --pbt-server` (~60 lines of Zig; `default.nix` applies it).
   It's the most robust option and the easiest one to add to another
   evaluator: unlike a REPL it takes multi-line expressions and any byte.
-  Both servers evaluate in read-write mode, like `nix repl`: sources and
-  derivations are written to the store. The fix server uses one daemon
-  connection instead of fix's usual pool of 8.
+  The CppNix server evaluates in read-write mode, like `nix repl`: sources
+  and derivations are written to the store. The fix server is read-only
+  unless given `--read-write-mode` (like `fix eval`; the patch also lets
+  `fix repl` take that flag), and keeps its parallel evaluator in
+  read-write mode, like `fix instantiate` (`fix eval --read-write-mode`
+  turns speculation off). It uses one daemon connection instead of fix's
+  usual pool of 8. `evaluators.env` runs fix three ways: read-write with
+  one worker (`fix`), read-write with 4 workers (`fixpar`), and read-only
+  (`fixro`).
 
 Sessions are pooled (one per concurrently running test, at most
 `NIX_PBT_MAX_SESSIONS`), restarted after a crash or timeout, and recycled
@@ -121,8 +127,9 @@ Throughput with `evaluators.env` (`nix-pbt-eval --bench`):
 |---|---|---|
 | CppNix | server (C API) | ~60,000 |
 | Lix | repl | ~30,000 |
-| fix | server, `--workers 1` | ~45,000 |
-| fix | server, default workers | ~21,000 |
+| fix | server, read-write, `--workers 1` | ~45,000 |
+| fix | server, read-write, `--workers 4` | ~25,000 |
+| fix | server, read-only, `--workers 1` | ~47,000 |
 | fix | repl, `--workers 1` | ~1,450 |
 | any | exec | ~30 |
 
@@ -139,35 +146,54 @@ divergence, tests mark the inputs that trigger it with a tag, and
 | `circular-import` | `flakes::*` | fix accepts some circular flake imports |
 | `lock-no-check` | `flakes::lock_files_are_interchangeable` | `fix flake lock` writes lock files with follow cycles / dangling follows |
 | `root-input-hash` | `flakes::lock_files_are_interchangeable` | fix: an input pointing at the root flake's own directory fails its lock file's `narHash` check |
-| `override-original` | `flakes::lock_files_are_interchangeable` | Lix: the `original` of an input overridden with a URL is the declared ref, not the override |
+| `lock-node-names` | `flakes::lock_files_are_interchangeable` | fix names duplicate input nodes (`a`, `a_2`) in a different order (lock files are compared with canonical node names) |
+| `override-original` | `flakes::lock_files_are_interchangeable` | Lix: the `original` of an input overridden with a URL is the declared ref, not the override (lock files are compared without `original`) |
 | `override-follows` | `flakes::lock_files_are_interchangeable` | Lix follows a `follows` that an input override replaced (stack overflow) |
-| `empty-list-laziness` | `exprs::*`, `builtins::*` | fix doesn't force `map`/`filter`/`sort`/`all`/…'s function on empty lists |
+| `empty-list-laziness` | `exprs::*`, `builtins::*` | fix doesn't force what `map`/`filter`/`sort`/`all`/… don't need on empty and one-element lists |
 | `invalid-utf8-json` | `exprs::*` | Lix < 2.95 crashes printing invalid UTF-8 as JSON |
 | `convert-hash` | `store::convert_hash`, `builtins::builtin_names` | Lix and fix have no `convertHash` |
 | `error-order` | `builtins::*`, `exprs::error_kinds_agree` | which of two errors wins depends on evaluation order, which differs (see Findings); only plant `throw`s in callbacks |
 | `context-compare` | `builtins::*` | fix: `<` on a string with context and one without is a type error |
 | `no-context` | `builtins::*` | fix accepts string context where CppNix rejects it |
 | `lax-types` | `builtins::*` | fix doesn't type-check some arguments like CppNix |
-| `function-equality` | `builtins::*` | Lix ≥ 2.94 and fix: `f == f` is `true`; CppNix: `false` |
+| `function-equality` | `builtins::*` | Lix ≥ 2.94 and fix: `f == f` is `true`; CppNix: `false` (and so `[ f ] < [ f ]` is an error) |
+| `throw-coercion` | `builtins::*` | fix: `throw` of a path or a set with `__toString`/`outPath` is a type error, which `tryEval` doesn't catch |
+| `number-select` | `builtins::operators_on_arbitrary_operands` | `0.a`: CppNix selects from `0`, Lix and fix reject it (`tokens-no-whitespace`) |
+| `tojson-outpath` | `builtins::*` | fix: `toJSON` of a set with a non-string `outPath` is a type error |
+| `generic-closure-operator` | `builtins::*` | fix: `genericClosure { startSet = [ ]; }` requires `operator` |
+| `foldl-thunk` | `builtins::*` | fix: `foldl' op nul [ ]` returns `nul` unforced, and applying it fails |
+| `regex` | `builtins::*` | `match`/`split` regular expressions (fix accepts some that CppNix rejects) |
 | `fetchtree-revcount` | `fetchers::*git*` | Lix returns `revCount` from `fetchTree` (CppNix only from `fetchGit`) |
 | `tarball-top-level` | `fetchers::fetch_tarball` | Lix wants exactly one top-level entry in a tarball |
 | `fetch-path-name` | `fetchers::*path*` | fix: `fetchTree { type = "path"; }` is named after the directory, not `source` |
 | `tarball-last-modified` | `fetchers::*tarball*` | fix: tarballs have `lastModified = 0` |
 | `git-dirty-rev` | `fetchers::fetch_git` | fix: a dirty repository gets `rev = HEAD` |
+| `canonpath-signed-char` | `fetchers::*git*` | CppNix drops a directory `src` from local git trees when there's a `srcü` next to it |
 | `git-stale-mount` | `fetchers::stale_git_mount` | CppNix reads a fetched git tree from a deleted repository |
 | `store-write-desync` | `store::store_errors_dont_poison_the_session`, and the harness | fix: after the daemon rejects a write, the connection is out of sync. With the tag, the harness also restarts a session after a daemon error, so that it doesn't spill into other tests |
-| `versions` | `builtins::*` | fix: `splitVersion`/`compareVersions` (see `versions.rs`, which still reports them) |
-| `failed-copy-crash` | `store::store_errors_dont_poison_the_session` | Lix main segfaults on the first store copy after a failed one |
+| `versions` | `versions::*`, `builtins::*` | fix: `splitVersion`/`compareVersions` of versions with `_` or other punctuation, non-ASCII, or components ≥ 2³¹ |
+| `float-to-int-range` | `arith::floor`, `arith::ceil` | fix: out-of-range results are `-9223372036854775808` |
+| `subnormal-literals` | `arith::*` | fix accepts subnormal float literals |
+| `to-string-float` | `strings::to_string_float` | fix rounds a float's shortest digits, not its exact value |
+| `drv-validation` | `store::derivation_paths` | fix accepts an empty or unwritable `system` and names too long for the store |
+| `drv-output-name` | `store::derivation_*` | Lix rejects an output named `drv` |
+| `context-nonexistent` | `store::append_context_nonexistent_path` | fix accepts context for paths that don't exist |
+| `split-context` | `store::context_through_builtins` | fix: `split` drops context |
+| `parse-drv-name` | `store::parse_drv_name_model` | fix: leading and trailing dashes |
+| `flakeref` | `flakeref::*` | fix's (and a bit of Lix's) flakeref parser; see Findings |
+| `read-only-outpath` | `fetchers::*` | read-only fix: fetched trees' `outPath` isn't in the store |
+| `path-lexing` | `builtins::operators_on_arbitrary_operands` | fix: `-./x` and `-/x` are negations, not paths |
+| `toxml-primop` | `builtins::*` | fix: `toXML` prints primops as `<function />` |
+| `read-only-names` | `store::to_file`, `store::derivation_paths` | read-only fix doesn't validate store path names |
+| `failed-copy-crash` | `store::store_errors_dont_poison_the_session`, and the harness | Lix main segfaults on the first store copy after copying a missing path fails. With the tag, the harness restarts a session after such an error |
 
-`known.env` sets all of them (for CppNix main, Lix main and fix main):
+`known.env` sets all of them (for CppNix main, Lix main and fix main), and
+then the suite passes: every failure is a new finding.
 
 ```sh
 . ./evaluators.env; . ./known.env
 nix-shell --run 'cargo test --no-fail-fast'
 ```
-
-Divergences found before tags existed (e.g. `splitVersion "__"`) still fail
-their tests; see Findings.
 
 ## Layout
 
@@ -235,14 +261,20 @@ against.
 | Area | Input | Nix | fix |
 |---|---|---|---|
 | laziness | `map (throw "f") [ ]`, same for `filter`, `sort`, `all`, `any`; `sort` of one element, `filterSource` of a file | forces the function | doesn't |
+| laziness | `sort lessThan [ (throw "x") ]` | forces the element | `[ … ]` |
+| parsing | `-./x`, `-/x` (e.g. `builtins.typeOf -./x`, `1 -./x`) | a path literal: `"path"`, calls `1` | negation of a path: type error |
+| `toXML` | `toXML builtins.add` | `<unevaluated />` | `<function />` |
+| laziness | `genericClosure { startSet = [ ]; }` | `[ ]` | error: missing attribute (`operator`) |
+| `foldl'` | `builtins.foldl' (x: x) (let f = a: a; in f) [ ] 1` | `1` | error: expected function, got thunk |
+| `toJSON` | `toJSON { outPath = 1; }`, `{ outPath = [ 1 ]; }`, … | the `outPath`, whatever it is: `"1"` | type error |
 | laziness | `removeAttrs { } [ (throw "t") ]` | error | `{ }` |
-| `toString` | `toString 3.002399751580331e16` | `"30023997515803312.000000"` | `"30023997515803310.000000"` |
+| `toString` | `toString 3.002399751580331e16`, `toString 1.0078125`, `toString 6.71088640127945e7` | `"30023997515803312.000000"`, `"1.007812"`, `"67108864.012794"`: the exact value, rounded to even | `"30023997515803310.000000"`, `"1.007813"`, `"67108864.012795"`: the shortest round-trip digits, rounded half up |
 | `splitVersion` | `"__"` / `"a_b"` / `"é"` | `["__"]` / `["a_b"]` / `["é"]` | `["_","_"]` / `["a","_","b"]` / type error |
 | `compareVersions` | `"0" "2147483648"` | `1` (32-bit component quirk) | `-1` |
 | `floor`/`ceil` | `floor 9.223372036854776e18` | error | `-9223372036854775808` |
 | float literals | `1.1125369292536007e-308` | error: invalid float | accepted |
-| `parseDrvName` | `"a-"` | `{ name = "a-"; }` | `{ name = "a"; }` |
-| `toFile` | `toFile ".-" ""` | error: invalid store path name | accepted without `--read-write-mode` (with it, the daemon rejects it) |
+| `parseDrvName` | `"a-"`, `"-0"` | `{ name = "a-"; version = ""; }`, `{ name = ""; version = "0"; }` | `{ name = "a"; }`, `{ name = "-0"; version = ""; }` |
+| `toFile`, `derivation` | `toFile ".-" ""`, an output named `"a b"` | error: invalid store path name | accepted without `--read-write-mode` (with it, the daemon rejects it) |
 | `derivation` | `name` such that `name.drv` > 211 chars | error | accepted |
 | `derivation` | `system = "\\"` | error (see Nix below) | accepted (same, unescaped, drv hash) |
 | string context | `appendContext` for a path that doesn't exist | error | accepted |
@@ -265,6 +297,7 @@ against.
 | flakes | circular import via input overrides | error: circular import | evaluates |
 | flakes | an input `path:/…/f0` in `/…/f0/flake.nix` (the flake's own directory), locked by CppNix | uses the lock file | error: NAR hash mismatch (the lock file changed the directory) |
 | `flake lock` | `inputs.a.follows = "a"`, follows to a missing input | error (`LockFile::check`) | writes the lock file |
+| `flake lock` | two inputs `b` and `c` from the same flake with an input `a` each, and `inputs.a.follows = "c"` | `b`'s is node `a`, `c`'s is `a_2` | the other way round: the same graph, but the lock file differs |
 | `parseFlakeRef` | `"nixpkgs"`, `"flake:nixpkgs/branch"` | `{ type = "indirect"; id = "nixpkgs"; … }` | resolves through the registry to a `channels.nixos.org` tarball |
 | `parseFlakeRef` | `"github:a/b#frag"`, `"/foo/bar#bla"`, `"git+https://#"` | error: unexpected fragment / drops `#` | fragment kept in `repo`/`path`/`url` |
 | `parseFlakeRef` | `"github:foo/bar?xyzzy=1"`, `"/foo/bar?xyzzy=1"` | error: unknown parameter | ignored |
@@ -276,14 +309,23 @@ against.
 
 fix fails 21 of the 31 cases from Nix's own `flakeref.cc`.
 
-**`tryEval`.** I looked for `throw`s that fix's `tryEval` doesn't catch
-but Nix's does: in the callbacks of every higher-order builtin, in
-`deepSeq`, `toJSON`, `toXML`, derivation attributes, string coercion
-(`__toString`), `<path>` lookups, `import`, with `--workers 1` and the
-parallel evaluator, over tens of thousands of generated cases
-(`builtins.rs`). There were none. Where the kinds of error differ, fix
-catches a `throw` that Nix never gets to, because Nix fails on an earlier
-argument first with an error `tryEval` doesn't catch:
+**`tryEval`.** `builtins.rs` looks for errors that `tryEval` catches in
+one implementation and not in another: every builtin and operator, with
+`throw`s, failed assertions and missing `<paths>` in their arguments and
+callbacks, over hundreds of thousands of cases. One is a fix bug:
+`throw` of a path, a derivation, or a set with `__toString` or `outPath`
+is a type error in fix, which `tryEval` doesn't catch; Nix coerces the
+argument to a string like interpolation does, so it's an ordinary `throw`
+(`builtins::throw_coerces_its_argument`):
+
+```
+nix-repl> builtins.tryEval (throw ./foo)
+{ success = false; value = false; }      # fix: error: expected a string, got path
+```
+
+In every other case where the kinds of error differ, fix catches a
+`throw` that Nix never gets to, because Nix fails on an earlier argument
+first with an error `tryEval` doesn't catch (the `error-order` tag):
 
 | Expression | Nix | fix |
 |---|---|---|
@@ -292,18 +334,42 @@ argument first with an error `tryEval` doesn't catch:
 | `hashFile "" (throw "t")` | unknown hash algorithm | `throw` |
 | `findFile [ ] "${ctx}"` | string has context | not found (a `throw`) |
 | `addErrorContext { } (throw "t")` | the `throw`, then coercing the context message fails, which replaces it | `throw` (the message is never coerced) |
+| `partition (x: throw "t") [ (abort "a") ]` | forces the element first: `abort` | calls the function first: `throw` |
+
+**Read-only mode and the parallel evaluator.** Read-only fix (`fixro`,
+like plain `fix eval`) gives the same results as read-write fix, except
+that it doesn't validate store path names (`toFile ".-" ""` works) and
+that fetched trees' `outPath` is the source directory or fix's cache
+instead of a store path, which also changes the `drvPath`s of derivations
+that use them. fix with 4 workers and speculation (`fixpar`, read-write)
+agreed with fix with 1 worker in every test, over the whole suite at
+20,000 cases per property (the slow `fetch_tarball` and
+`lock_files_are_interchangeable` at a few thousand).
 
 What agrees: all other builtins covered here, over thousands of cases;
 `drvPath`/`outPath` for random derivations, bit for bit; `follows` and
 override resolution over thousands of random flake graphs; lock files,
-which are identical to CppNix's and interchangeable with them; 10,000
-random expressions once the empty-list laziness issue is skipped; and NAR
+which are identical to CppNix's and interchangeable with them; random
+expressions once the empty-list laziness issue is skipped; and NAR
 hashes and store paths of `builtins.path`, `filterSource` and `fetchTree`
 (`git` and `tarball`, read-write mode) for thousands of angry file trees
 and the angryfiles corpus.
 
 ### CppNix
 
+- **Local git trees lose directories.** A directory `X` is left out of
+  `fetchTree`/`fetchGit` of a local git repository (so also out of git
+  flakes and their `narHash`) when a sibling is named `X` followed by a
+  non-ASCII byte: `src/` next to `srcü`, `b/` next to `bé`. Since 2.2x (2.18
+  is fine; 2.31, 2.34 and main aren't); Lix is fine. The cause:
+  `CanonPath::operator<=>` compares `char`s, which are signed on x86-64,
+  so `srcü` sorts between `src` and `src/x`, breaking its documented
+  invariant that children directly follow their directory.
+  `CanonPath::isAllowed` relies on it (`allowed.lower_bound(path)` should
+  find a child of `src`, finds `srcü`), so the allow-list accessor over
+  the working tree (`git-utils.cc`) hides `src`. Comparing as `unsigned
+  char` should fix it; on aarch64 `char` is unsigned, so it presumably
+  doesn't happen there (`fetchers::git_signed_char_names`).
 - **Fetched git trees are read from a stale repository.** CppNix doesn't
   copy a `fetchTree` git result to the store; it serves the store path
   from the repository it fetched it from. If the same tree (same NAR hash)
