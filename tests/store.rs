@@ -32,7 +32,11 @@ fn to_file(tc: TestCase) {
     let contents = tc.draw(nix_strings());
     let expect: Expect = match store::check_name(&name) {
         Ok(()) => Expect::value(store::text_path(&name, contents.as_bytes(), &[])),
-        Err(_) => Expect::Error,
+        Err(_) => {
+            // Read-only fix doesn't check names (the daemon does).
+            skip_known(&tc, "read-only-names");
+            Expect::Error
+        }
     };
     check(
         &format!(
@@ -251,9 +255,25 @@ fn derivation_paths(tc: TestCase) {
         }
         Err(e) => {
             tc.note(&format!("model: error: {e}"));
+            // fix accepts an empty `system`, a `system` it can't write to
+            // the .drv, and names too long for a store path.
+            if e == "required attribute missing"
+                || e.starts_with("unparsable .drv")
+                || e.contains("longer than")
+            {
+                skip_known(&tc, "drv-validation");
+            }
+            // Read-only fix doesn't check names (the daemon does).
+            if e.starts_with("illegal character") || e.contains("is not valid") {
+                skip_known(&tc, "read-only-names");
+            }
             Expect::Error
         }
     };
+    // Lix rejects an output named `drv`.
+    if spec.outputs.iter().flatten().any(|o| o == "drv") {
+        skip_known(&tc, "drv-output-name");
+    }
     check(
         &format!(
             "let d = {}; in [ d.drvPath (map (o: d.${{o}}.outPath) (d.outputs or [ \"out\" ])) ]",
@@ -270,6 +290,10 @@ fn derivation_context(tc: TestCase) {
     let Ok(drv) = spec.model() else {
         tc.reject();
     };
+    // Lix rejects an output named `drv`.
+    if drv.outputs.iter().any(|o| o == "drv") {
+        skip_known(&tc, "drv-output-name");
+    }
     let p = drv.paths();
     let mut want = vec![json!({ p.drv_path.clone(): { "allOutputs": true } })];
     for o in &drv.outputs {
@@ -509,6 +533,10 @@ fn context_propagation(tc: TestCase) {
 /// asks for context on (random, so almost certainly absent) paths.
 #[hegel::test]
 fn append_context_nonexistent_path(tc: TestCase) {
+    // fix accepts them.
+    if is_skipped("context-nonexistent") {
+        return;
+    }
     let hash = tc.draw(gs::from_regex(r"[0-9a-df-np-sv-z]{32}").fullmatch(true));
     let is_drv = tc.draw(gs::booleans());
     let path = format!(
@@ -553,6 +581,10 @@ fn context_through_builtins(tc: TestCase) {
         format!("builtins.concatStringsSep {a} [ \"x\" ]"),
         format!("builtins.concatStringsSep {a} [ \"x\" \"y\" ]"),
     ]));
+    // fix: `split` drops its argument's context.
+    if op.contains("builtins.split") {
+        skip_known(&tc, "split-context");
+    }
     check(
         &ctx.around(&format!("builtins.getContext ({op})")),
         Expect::Unspecified,
@@ -581,6 +613,11 @@ fn parse_drv_name_model(tc: TestCase) {
         nix_strings(),
     ));
     let (name, version) = parse_drv_name(&s);
+    // fix: a trailing dash is dropped (`"a-"` gives name `"a"`), and a
+    // leading one doesn't start the version (`"-0"` gives name `"-0"`).
+    if s.starts_with('-') || s.ends_with('-') {
+        skip_known(&tc, "parse-drv-name");
+    }
     check(
         &format!("builtins.parseDrvName {}", nix_string_literal(&s)),
         Expect::value(json!({ "name": name, "version": version })),

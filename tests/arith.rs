@@ -121,10 +121,21 @@ fn rounding(tc: TestCase, name: &str, f: fn(f64) -> f64) {
         nix_floats(),
         gs::floats::<f64>().min_value(-1e19).max_value(1e19),
     ));
+    // CppNix and Lix reject subnormal literals; fix accepts them.
+    if x != 0.0 && x.abs() < f64::MIN_POSITIVE {
+        skip_known(&tc, "subnormal-literals");
+        check(
+            &format!("builtins.{name} {}", nix_float_literal(x)),
+            Expect::Error,
+        );
+        return;
+    }
     let r = f(x);
     let expect = if (-9223372036854775808.0..9223372036854775808.0).contains(&r) {
         Expect::value(r as i64)
     } else {
+        // fix returns i64::MIN.
+        skip_known(&tc, "float-to-int-range");
         Expect::Error
     };
     check(&format!("builtins.{name} {}", nix_float_literal(x)), expect);
@@ -158,6 +169,10 @@ fn int_literal_range(tc: TestCase) {
 /// subnormal literals, so there is no agreed-upon model.
 #[hegel::test]
 fn subnormal_float_literal(tc: TestCase) {
+    // fix accepts them.
+    if is_skipped("subnormal-literals") {
+        return;
+    }
     let f = tc.draw(
         gs::floats::<f64>()
             .min_value(f64::MIN_POSITIVE / 2.0f64.powi(52))

@@ -124,6 +124,11 @@ const UNIT_ATTRS: &[(&str, &str)] = &[
 /// Runs every case and reports all failures at once.
 #[test]
 fn nix_unit_test_cases() {
+    // fix's parser disagrees in many ways (21 of the 31 `flakeref.cc`
+    // cases), Lix's in a few.
+    if is_skipped("flakeref") {
+        return;
+    }
     let mut failures = Vec::new();
     let mut run = |expr: String, expect: Expect| {
         if let Err(e) = std::panic::catch_unwind(|| check(&expr, expect)) {
@@ -350,6 +355,11 @@ fn url_ish(tc: &TestCase) -> String {
 /// `parseFlakeRef (flakeRefToString attrs) == attrs`.
 #[hegel::test]
 fn attrs_round_trip(tc: TestCase) {
+    // fix's parser disagrees in many ways (21 of the 31 `flakeref.cc`
+    // cases), Lix's in a few.
+    if is_skipped("flakeref") {
+        return;
+    }
     let attrs = tc.draw(flake_ref_attrs().print_as_debug());
     check(
         &format!(
@@ -364,6 +374,11 @@ fn attrs_round_trip(tc: TestCase) {
 /// `toString (parse (toString (parse s))) == toString (parse s)`.
 #[hegel::test]
 fn canonical_form_is_a_fixed_point(tc: TestCase) {
+    // fix's parser disagrees in many ways (21 of the 31 `flakeref.cc`
+    // cases), Lix's in a few.
+    if is_skipped("flakeref") {
+        return;
+    }
     let url = tc.draw(url_ish());
     let expr = round_trip(&url);
     if let Outcome::Value(Json::String(canonical)) = check(&expr, Expect::Unspecified) {
@@ -374,6 +389,11 @@ fn canonical_form_is_a_fixed_point(tc: TestCase) {
 /// Parsing arbitrary URL-ish strings: the attributes (or the failure) agree.
 #[hegel::test]
 fn parse_url_ish(tc: TestCase) {
+    // fix's parser disagrees in many ways (21 of the 31 `flakeref.cc`
+    // cases), Lix's in a few.
+    if is_skipped("flakeref") {
+        return;
+    }
     let url = tc.draw(url_ish());
     check(
         &format!("builtins.parseFlakeRef {}", nix_string_literal(&url)),
@@ -385,6 +405,11 @@ fn parse_url_ish(tc: TestCase) {
 /// agrees.
 #[hegel::test]
 fn to_string_differential(tc: TestCase) {
+    // fix's parser disagrees in many ways (21 of the 31 `flakeref.cc`
+    // cases), Lix's in a few.
+    if is_skipped("flakeref") {
+        return;
+    }
     let attrs = tc.draw(flake_ref_attrs().print_as_debug());
     check(
         &format!("builtins.flakeRefToString {}", attrs_nix(&attrs)),

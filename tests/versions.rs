@@ -102,9 +102,27 @@ fn compare_versions(v1: &str, v2: &str) -> Ordering {
     Ordering::Equal
 }
 
+/// fix: other characters than letters, digits, `.` and `-` are components
+/// of their own (`"a_b"` gives `["a", "_", "b"]`), non-ASCII is a type
+/// error, and components ≥ 2³¹ are numbers (in Nix, they don't fit an `int`
+/// and count as words).
+fn skip_fix_version_quirks(tc: &TestCase, v: &str) {
+    let big_number = v.split(|c: char| !c.is_ascii_digit()).any(|n| {
+        n.parse::<u64>()
+            .map_or(!n.is_empty(), |n| n > i32::MAX as u64)
+    });
+    let odd = v
+        .chars()
+        .any(|c| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'));
+    if odd || big_number {
+        skip_known(tc, "versions");
+    }
+}
+
 #[hegel::test]
 fn split_version_model(tc: TestCase) {
     let v = tc.draw(versions());
+    skip_fix_version_quirks(&tc, &v);
     check(
         &format!("builtins.splitVersion {}", nix_string_literal(&v)),
         Expect::value(split_version(&v)),
@@ -115,6 +133,8 @@ fn split_version_model(tc: TestCase) {
 fn compare_versions_model(tc: TestCase) {
     let a = tc.draw(versions());
     let b = tc.draw(versions());
+    skip_fix_version_quirks(&tc, &a);
+    skip_fix_version_quirks(&tc, &b);
     check(
         &format!(
             "builtins.compareVersions {} {}",

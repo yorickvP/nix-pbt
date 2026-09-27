@@ -395,10 +395,40 @@ fn model(g: &Graph) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 // Properties
 
+/// Whether an override gives an input a URL where the flake it belongs to
+/// declares it with `follows`. Lix still follows it (and overflows the
+/// stack).
+fn overrides_a_follows(g: &Graph) -> bool {
+    fn check(g: &Graph, target: usize, overrides: &BTreeMap<String, InputDecl>) -> bool {
+        overrides.iter().any(|(name, o)| {
+            let declared = g.flakes[target].get(name);
+            let replaces_follows = matches!(o.spec, Spec::Url(_))
+                && matches!(declared, Some(d) if matches!(d.spec, Spec::Follows(_)));
+            let nested = match (&o.spec, declared) {
+                (Spec::Url(t), _) => check(g, *t, &o.overrides),
+                (
+                    _,
+                    Some(InputDecl {
+                        spec: Spec::Url(t), ..
+                    }),
+                ) => check(g, *t, &o.overrides),
+                _ => false,
+            };
+            replaces_follows || nested
+        })
+    }
+    g.flakes
+        .iter()
+        .flat_map(|f| f.values())
+        .any(|d| match d.spec {
+            Spec::Url(t) => check(g, t, &d.overrides),
+            Spec::Follows(_) => false,
+        })
+}
+
 #[hegel::test]
 fn follows_resolution(tc: TestCase) {
     let g = tc.draw(graphs());
-    let dir = FlakeDir::create(&g);
     let expect = model(&g);
     tc.note(&format!("model: {expect:?}"));
     tc.event(match &expect {
@@ -413,6 +443,12 @@ fn follows_resolution(tc: TestCase) {
     if matches!(&expect, Err(e) if e.starts_with("circular import")) {
         skip_known(&tc, "circular-import");
     }
+    if overrides_a_follows(&g) {
+        skip_known(&tc, "override-follows");
+    }
+    // After the skips: rejecting a test case unwinds, which keeps the
+    // directory as if the test had failed.
+    let dir = FlakeDir::create(&g);
     check(
         &format!(
             "(builtins.getFlake \"path:{}\").value",
@@ -448,16 +484,6 @@ fn lock_files_are_interchangeable(tc: TestCase) {
     }
     if g.flakes.iter().flat_map(|f| f.values()).any(refers_to_root) {
         skip_known(&tc, "root-input-hash");
-    }
-    // Lix writes the declared ref as the `original` of an input that an
-    // override replaced with a URL; CppNix and fix write the override.
-    fn overrides_url(d: &InputDecl) -> bool {
-        d.overrides
-            .values()
-            .any(|o| matches!(o.spec, Spec::Url(_)) || overrides_url(o))
-    }
-    if g.flakes.iter().flat_map(|f| f.values()).any(overrides_url) {
-        skip_known(&tc, "override-original");
     }
     // `fix flake lock` doesn't do LockFile::check: it writes lock files with
     // follow cycles and follows to non-existent inputs.
@@ -510,6 +536,24 @@ fn lock_files_are_interchangeable(tc: TestCase) {
         );
         locks.push((locker.name.clone(), json));
     }
+    // Lix writes the declared ref as the `original` of an input that an
+    // override replaced with a URL; CppNix and fix write the override.
+    if is_skipped("override-original") {
+        for (_, lock) in &mut locks {
+            if let Some(nodes) = lock.get_mut("nodes").and_then(|n| n.as_object_mut()) {
+                for node in nodes.values_mut() {
+                    node.as_object_mut().map(|n| n.remove("original"));
+                }
+            }
+        }
+    }
+    // fix names nodes differently when there are several of one input
+    // (`a` and `a_2`); the lock files mean the same.
+    if is_skipped("lock-node-names") {
+        for (_, lock) in &mut locks {
+            *lock = canonical_node_names(lock);
+        }
+    }
     for (name, lock) in &locks[1.min(locks.len())..] {
         assert_eq!(
             lock, &locks[0].1,
@@ -517,6 +561,52 @@ fn lock_files_are_interchangeable(tc: TestCase) {
             locks[0].0
         );
     }
+}
+
+/// A lock file with its nodes renamed `n0`, `n1`, ... in the order a
+/// depth-first walk from the root, through inputs in name order, reaches
+/// them. `follows` (arrays of input names) don't refer to node names.
+fn canonical_node_names(lock: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let Some(nodes) = lock.get("nodes").and_then(Value::as_object) else {
+        return lock.clone();
+    };
+    let root = lock["root"].as_str().unwrap_or("root").to_string();
+    let mut names: BTreeMap<String, String> = BTreeMap::new();
+    let mut stack = vec![root.clone()];
+    while let Some(id) = stack.pop() {
+        if names.contains_key(&id) {
+            continue;
+        }
+        let new = if id == root {
+            "root".to_string()
+        } else {
+            format!("n{}", names.len())
+        };
+        names.insert(id.clone(), new);
+        if let Some(inputs) = nodes.get(&id).and_then(|n| n["inputs"].as_object()) {
+            // Reversed, so that the stack pops them in name order.
+            for target in inputs.values().rev().filter_map(Value::as_str) {
+                stack.push(target.to_string());
+            }
+        }
+    }
+    let mut renamed = Map::new();
+    for (id, node) in nodes {
+        let mut node = node.clone();
+        if let Some(inputs) = node.get_mut("inputs").and_then(Value::as_object_mut) {
+            for target in inputs.values_mut() {
+                if let Some(t) = target.as_str() {
+                    *target = Value::String(names.get(t).cloned().unwrap_or_else(|| t.to_string()));
+                }
+            }
+        }
+        renamed.insert(names.get(id).cloned().unwrap_or_else(|| id.clone()), node);
+    }
+    let mut lock = lock.clone();
+    lock["nodes"] = Value::Object(renamed);
+    lock["root"] = Value::String("root".into());
+    lock
 }
 
 /// The examples from `follow-paths.sh`, as a sanity check of the model.

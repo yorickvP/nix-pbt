@@ -17,8 +17,8 @@
 //! resulting store paths. `angry_corpus` does the same for a fixed tree with
 //! every one-byte name and every name length.
 
-use hegel::TestCase;
 use hegel::generators::{self as gs, Generator};
+use hegel::{HealthCheck, TestCase};
 use nix_pbt::store::{hex, make_store_path, sha256};
 use nix_pbt::*;
 use serde_json::{Value as Json, json};
@@ -340,9 +340,8 @@ fn show_tree(tree: &Tree, indent: usize, out: &mut String) {
 /// Timestamp of every file, commit and tarball entry.
 const MTIME: i64 = 1700000000;
 
-/// A scratch directory, deleted afterwards unless the test failed or it's
-/// marked to be kept.
-struct Scratch(PathBuf, bool);
+/// A scratch directory, deleted afterwards unless the test failed.
+struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Scratch {
@@ -354,15 +353,7 @@ impl Scratch {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir, false)
-    }
-
-    /// Keep the directory. CppNix reads fetched git trees lazily from the
-    /// repository they were first fetched from, even when the same tree is
-    /// fetched from another one later (see `stale_git_mount`).
-    fn keep(mut self) -> Scratch {
-        self.1 = true;
-        self
+        Scratch(dir)
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -374,7 +365,7 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         if std::thread::panicking() {
             eprintln!("trees kept at {}", self.0.display());
-        } else if !self.1 {
+        } else {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
@@ -439,6 +430,15 @@ fn lit(path: &Path) -> String {
 // ---------------------------------------------------------------------------
 // Checks
 
+/// Check the `outPath` of a fetched tree. In read-only mode (like plain
+/// `fix eval`), fix points it at the source directory or its own cache
+/// instead of the store.
+fn check_out_path(expr: &str, want: String) {
+    if !is_skipped("read-only-outpath") {
+        check(expr, Expect::value(want));
+    }
+}
+
 /// `builtins.path`, `filterSource`, `fetchTree { type = "path"; }`, and a
 /// walk of the tree and its copies.
 fn check_path_copies(tc: Option<&TestCase>, dir: &Path, tree: &Tree) {
@@ -452,22 +452,15 @@ fn check_path_copies(tc: Option<&TestCase>, dir: &Path, tree: &Tree) {
         &format!("{WALK} {p} \"directory\""),
         Expect::Value(walk_model(&node)),
     );
-    // fix names the store path after the directory, not `source`.
-    let (fields, want) = if is_skipped("fetch-path-name") {
-        ("[ r.narHash ]", json!([sri(&node)]))
-    } else {
-        (
-            "[ r.outPath r.narHash ]",
-            json!([source_path(&node, "source"), sri(&node)]),
-        )
-    };
-    check(
-        &format!(
-            "let r = builtins.fetchTree {{ type = \"path\"; path = {}; }}; in {fields}",
-            lit(dir)
-        ),
-        Expect::Value(want),
+    let fetch = format!(
+        "builtins.fetchTree {{ type = \"path\"; path = {}; }}",
+        lit(dir)
     );
+    check(&format!("({fetch}).narHash"), Expect::value(sri(&node)));
+    // fix names the store path after the directory, not `source`.
+    if !is_skipped("fetch-path-name") {
+        check_out_path(&format!("({fetch}).outPath"), source_path(&node, "source"));
+    }
     check(
         &format!(
             "builtins.attrNames (builtins.fetchTree {{ type = \"path\"; path = {}; }})",
@@ -525,6 +518,18 @@ fn check_path_copies(tc: Option<&TestCase>, dir: &Path, tree: &Tree) {
 /// tree committed, then with a tracked file modified and an untracked one
 /// added.
 fn check_git(scratch: &Scratch, tree: &Tree, dirty: bool) {
+    // A file of its own in every repository: CppNix reads a fetched tree
+    // from the repository it first fetched it from, even after that one is
+    // gone (see `stale_git_mount`), so no two test cases may share a tree.
+    let mut tree = tree.clone();
+    tree.insert(
+        b"nix-pbt-id".to_vec(),
+        Node::File {
+            contents: scratch.0.display().to_string().into_bytes(),
+            exec: false,
+        },
+    );
+    let tree = &tree;
     let repo = scratch.path("repo");
     write_tree(&repo, tree);
     run(Command::new("git")
@@ -567,14 +572,13 @@ fn check_git(scratch: &Scratch, tree: &Tree, dirty: bool) {
     check(
         &format!(
             "let r = builtins.fetchTree {{ type = \"git\"; url = {url}; }}; in \
-             [ r.outPath r.narHash (r.rev or r.dirtyRev) r.lastModified ]"
+             [ r.narHash (r.rev or r.dirtyRev) r.lastModified ]"
         ),
-        Expect::value(json!([
-            source_path(&node, "source"),
-            sri(&node),
-            rev_value,
-            MTIME
-        ])),
+        Expect::value(json!([sri(&node), rev_value, MTIME])),
+    );
+    check_out_path(
+        &format!("(builtins.fetchTree {{ type = \"git\"; url = {url}; }}).outPath"),
+        source_path(&node, "source"),
     );
     // Lix also returns `revCount`, which CppNix only computes for
     // `fetchGit`.
@@ -595,9 +599,9 @@ fn check_git(scratch: &Scratch, tree: &Tree, dirty: bool) {
         ),
         Expect::Value(walk_model(&node)),
     );
-    check(
+    check_out_path(
         &format!("(builtins.fetchGit {}).outPath", lit(&repo)),
-        Expect::value(source_path(&node, "source")),
+        source_path(&node, "source"),
     );
     // With `rev`, the commit, not the working tree.
     check(
@@ -673,13 +677,13 @@ fn check_tarball(scratch: &Scratch, tree: &Tree, layout: TarLayout, gzip: bool) 
     check(
         &format!(
             "let r = builtins.fetchTree {{ type = \"tarball\"; url = {url}; }}; in \
-             [ r.outPath r.narHash {lm_field} ]"
+             [ r.narHash {lm_field} ]"
         ),
-        Expect::value(json!([
-            source_path(&node, "source"),
-            sri(&node),
-            last_modified
-        ])),
+        Expect::value(json!([sri(&node), last_modified])),
+    );
+    check_out_path(
+        &format!("(builtins.fetchTree {{ type = \"tarball\"; url = {url}; }}).outPath"),
+        source_path(&node, "source"),
     );
     check(
         &format!(
@@ -687,9 +691,9 @@ fn check_tarball(scratch: &Scratch, tree: &Tree, layout: TarLayout, gzip: bool) 
         ),
         Expect::Value(walk_model(&node)),
     );
-    check(
+    check_out_path(
         &format!("builtins.fetchTarball {url}"),
-        Expect::value(source_path(&node, "source")),
+        source_path(&node, "source"),
     );
 }
 
@@ -705,7 +709,8 @@ fn draw_tree(tc: &TestCase) -> Tree {
     tree
 }
 
-#[hegel::test]
+// Each case fetches a tree with every evaluator, which is slow.
+#[hegel::test(suppress_health_check = [HealthCheck::TooSlow])]
 fn path_copies(tc: TestCase) {
     let tree = draw_tree(&tc);
     let scratch = Scratch::new();
@@ -715,15 +720,34 @@ fn path_copies(tc: TestCase) {
     check_path_copies(Some(&tc), &dir, &tree);
 }
 
-#[hegel::test]
+/// Whether a directory has a sibling named like it plus a non-ASCII byte
+/// (`src` and `srcü`). CppNix compares `CanonPath`s as signed chars, which
+/// sorts `srcü` between `src` and `src/…`, and then drops `src` from local
+/// git trees (see `git_signed_char_names`).
+fn has_signed_char_siblings(tree: &Tree) -> bool {
+    tree.iter().any(|(name, node)| match node {
+        Node::Dir(sub) => {
+            tree.keys().any(|other| {
+                other.len() > name.len() && other.starts_with(name) && other[name.len()] >= 0x80
+            }) || has_signed_char_siblings(sub)
+        }
+        _ => false,
+    })
+}
+
+// Each case fetches a tree with every evaluator, which is slow.
+#[hegel::test(suppress_health_check = [HealthCheck::TooSlow])]
 fn fetch_git(tc: TestCase) {
     let tree = draw_tree(&tc);
+    if has_signed_char_siblings(&tree) {
+        skip_known(&tc, "canonpath-signed-char");
+    }
     let dirty = tc.draw(gs::booleans());
     // fix reports the dirty tree as `rev = HEAD`.
     if dirty {
         skip_known(&tc, "git-dirty-rev");
     }
-    check_git(&Scratch::new().keep(), &tree, dirty);
+    check_git(&Scratch::new(), &tree, dirty);
 }
 
 /// CppNix serves a fetched git tree's store path from the repository it was
@@ -786,7 +810,8 @@ fn stale_git_mount() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-#[hegel::test]
+// Each case fetches a tree with every evaluator, which is slow.
+#[hegel::test(suppress_health_check = [HealthCheck::TooSlow])]
 fn fetch_tarball(tc: TestCase) {
     let tree = draw_tree(&tc);
     let mut layouts = vec![TarLayout::TopDir];
@@ -817,6 +842,27 @@ fn fetchurl_file(tc: TestCase) {
         &format!("builtins.hashFile \"sha256\" (builtins.fetchurl {url})"),
         Expect::value(hex(&sha256(&contents))),
     );
+}
+
+/// A directory `src` next to a file `srcü`: CppNix (on x86-64) drops the
+/// directory from local git trees.
+#[test]
+fn git_signed_char_names() {
+    if is_skipped("canonpath-signed-char") {
+        return;
+    }
+    let file = |c: &str| Node::File {
+        contents: c.as_bytes().to_vec(),
+        exec: false,
+    };
+    let tree = BTreeMap::from([
+        (
+            b"src".to_vec(),
+            Node::Dir(BTreeMap::from([(b"x".to_vec(), file("x"))])),
+        ),
+        ("srcü".as_bytes().to_vec(), file("u")),
+    ]);
+    check_git(&Scratch::new(), &tree, false);
 }
 
 /// The angryfiles tree: every one-byte name as a file, a directory, a
@@ -885,7 +931,7 @@ fn angry_corpus_path() {
 
 #[test]
 fn angry_corpus_git() {
-    check_git(&Scratch::new().keep(), &angry_tree(), false);
+    check_git(&Scratch::new(), &angry_tree(), false);
 }
 
 #[test]

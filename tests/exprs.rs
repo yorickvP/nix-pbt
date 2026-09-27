@@ -164,7 +164,9 @@ impl Gen<'_> {
             7 => format!("(builtins.foldl' builtins.add 0 {})", self.expr(Ty::List)),
             8 => format!("(builtins.head {})", self.expr(Ty::List)),
             9 => format!("({} {})", self.expr(Ty::Fun), self.expr(Ty::Int)),
-            10 => {
+            // Which error `tryEval` sees depends on evaluation order, which
+            // differs (see `error_kinds_agree`).
+            10 if !is_skipped("error-order") => {
                 let e = self.expr(Ty::Int);
                 format!("(let r = builtins.tryEval {e}; in if r.success then r.value else -1)")
             }
@@ -272,7 +274,17 @@ impl Gen<'_> {
                 self.expr(Ty::Fun),
                 self.int(0, 4)
             ),
-            5 => format!("(builtins.sort builtins.lessThan {})", self.expr(Ty::List)),
+            5 => {
+                let l = self.expr(Ty::List);
+                // fix doesn't force the element of a one-element list.
+                if is_skipped("empty-list-laziness") {
+                    format!(
+                        "(let l = {l}; in builtins.deepSeq l (builtins.sort builtins.lessThan l))"
+                    )
+                } else {
+                    format!("(builtins.sort builtins.lessThan {l})")
+                }
+            }
             6 => format!("(builtins.attrValues {})", self.expr(Ty::Attrs)),
             _ => format!("(builtins.tail {})", self.expr(Ty::List)),
         }

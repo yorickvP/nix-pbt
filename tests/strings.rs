@@ -142,11 +142,51 @@ fn to_string_int(tc: TestCase) {
     );
 }
 
+/// The shortest decimal digits that round-trip to `f`, rounded half up to
+/// six decimals: how fix's `toString` prints floats.
+fn round_shortest_half_up(f: f64) -> String {
+    let shortest = format!("{f}");
+    let (int, frac) = shortest.split_once('.').unwrap_or((&shortest, ""));
+    let mut digits: Vec<u8> = format!("{int}{frac:0<7}").into_bytes();
+    let keep = int.len() + 6;
+    let up = digits[keep] >= b'5';
+    digits.truncate(keep);
+    if up {
+        let mut i = keep;
+        loop {
+            if i == 0 {
+                digits.insert(0, b'1');
+                break;
+            }
+            i -= 1;
+            if digits[i] == b'9' {
+                digits[i] = b'0';
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+    }
+    let s = String::from_utf8(digits).unwrap();
+    format!("{}.{}", &s[..s.len() - 6], &s[s.len() - 6..])
+}
+
 /// `toString` on floats has no simple model (it is `%g`-like and lossy), so
 /// this is differential only.
 #[hegel::test]
 fn to_string_float(tc: TestCase) {
     let f = tc.draw(nix_floats());
+    // Nix prints the float's exact value rounded to six decimals (`%f`).
+    // fix rounds the shortest digits that round-trip instead, half up:
+    // 30023997515803310.000000 for 3.002399751580331e16 (exactly
+    // 30023997515803312), 1.007813 for 1.0078125 (Nix: to even),
+    // 67108864.012795 for 6.71088640127945e7 (exactly 67108864.01279449…).
+    let digits = format!("{:.30}", f.abs());
+    let decimals = &digits[digits.find('.').unwrap() + 1..];
+    let tie = decimals.as_bytes()[6] == b'5' && decimals[7..].bytes().all(|b| b == b'0');
+    if tie || round_shortest_half_up(f.abs()) != format!("{:.6}", f.abs()) {
+        skip_known(&tc, "to-string-float");
+    }
     check(
         &format!("builtins.toString {}", nix_float_literal(f)),
         Expect::Unspecified,

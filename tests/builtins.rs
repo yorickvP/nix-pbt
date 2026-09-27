@@ -350,7 +350,13 @@ impl Gen<'_> {
             Fun(1) => (FUNS1, FUNS2),
             _ => (FUNS2, FUNS1),
         };
-        self.pick(if self.chance(0.9) { right } else { wrong })
+        let f = self.pick(if self.chance(0.9) { right } else { wrong });
+        // A throwing callback and a planted uncatchable error: which one
+        // wins depends on evaluation order.
+        if f.contains("throw") && self.errors == UNCATCHABLE && is_skipped("error-order") {
+            return "(x: true)".into();
+        }
+        f
     }
 }
 
@@ -363,11 +369,33 @@ fn skip_known_calls(tc: &TestCase, call: &str) {
     if context && compares {
         skip_known(tc, "context-compare");
     }
+    // fix: `toJSON` of a set whose `outPath` isn't a string or path is a
+    // type error; Nix serialises the `outPath`, whatever it is.
+    if call.contains("toJSON") && call.contains("\"outPath\"") {
+        skip_known(tc, "tojson-outpath");
+    }
+    // Regular expressions aren't compatible yet (fix: `{"a":1}` is a
+    // literal, CppNix: invalid).
+    if call.contains("builtins.match") || call.contains("builtins.split") {
+        skip_known(tc, "regex");
+    }
+    // fix prints primops as `<function />` in XML, Nix as `<unevaluated />`.
+    const PRIMOPS: &[&str] = &[
+        "builtins.isInt",
+        "builtins.attrNames",
+        "toString",
+        "builtins.add",
+        "builtins.lessThan",
+    ];
+    if call.contains("toXML") && PRIMOPS.iter().any(|p| call.contains(p)) {
+        skip_known(tc, "toxml-primop");
+    }
     // CppNix: functions never compare equal, not even to themselves (except
     // inside lists and sets, which compare elements by pointer first). Lix
     // ≥ 2.94 and fix compare them by identity.
     let has_fun = FUNS1.iter().chain(FUNS2).any(|f| call.contains(f));
-    if has_fun && (call.contains("==") || call.contains("!=") || call.contains("builtins.elem ")) {
+    let compares_eq = ["==", "!=", "builtins.elem ", "<", "lessThan", "sort"];
+    if has_fun && compares_eq.iter().any(|c| call.contains(c)) {
         skip_known(tc, "function-equality");
     }
     // fix: `splitVersion`/`compareVersions` differ, see `versions.rs`.
@@ -463,6 +491,21 @@ fn builtins_on_arbitrary_arguments(tc: TestCase) {
         .map(|i| g.arg(params.get(i).copied().unwrap_or(Any), depth))
         .collect();
     let call = format!("builtins.{name} {}", args.join(" "));
+    // fix: `genericClosure` requires `operator` even with nothing to apply
+    // it to.
+    if name == "genericClosure" && !call.contains("\"operator\"") {
+        skip_known(&tc, "generic-closure-operator");
+    }
+    // fix: `foldl'` of an empty list returns the initial value unforced, and
+    // applying that fails (see `foldl_initial_value_is_forced`).
+    if name == "foldl'" && n > params.len() {
+        skip_known(&tc, "foldl-thunk");
+    }
+    // fix: `throw` of anything but a string is a type error (see
+    // `throw_coerces_its_argument`).
+    if name == "throw" && !args.first().is_some_and(|a| a.starts_with('"')) {
+        skip_known(&tc, "throw-coercion");
+    }
     skip_known_calls(&tc, &call);
     let expr = try_deep(&call);
     tc.note(&format!("call: {call}"));
@@ -512,9 +555,50 @@ fn operators_on_arbitrary_operands(tc: TestCase) {
     let g = Gen::new(&tc);
     let (a, b) = (g.arg(ka, 1), g.arg(kb, 1));
     let e = template.replace("⟨a⟩", &a).replace("⟨b⟩", &b);
+    // `0.a`: CppNix selects from `0`; Lix and fix reject it (Lix's
+    // `tokens-no-whitespace` deprecation).
+    if template.starts_with("⟨a⟩.a") && a.starts_with(|c: char| c.is_ascii_digit()) {
+        skip_known(&tc, "number-select");
+    }
+    // `-./x` and `-/x` are path literals; fix reads them as negations.
+    if e.starts_with("-.") || e.starts_with("-/") {
+        skip_known(&tc, "path-lexing");
+    }
     skip_known_calls(&tc, &e);
     let out = check(&try_deep(&e), Expect::Unspecified);
     tc.event(describe(&out));
+}
+
+/// `throw` coerces its argument to a string like string interpolation does,
+/// so these are all ordinary, catchable `throw`s.
+#[test]
+fn throw_coerces_its_argument() {
+    if is_skipped("throw-coercion") {
+        return;
+    }
+    for arg in [
+        "./servers",
+        "{ __toString = s: \"m\"; }",
+        "{ outPath = \"/x\"; }",
+        "(derivation { name = \"d\"; system = \"x\"; builder = \"/b\"; })",
+    ] {
+        check(
+            &format!("builtins.tryEval (builtins.throw {arg})"),
+            Expect::value(serde_json::json!({ "success": false, "value": false })),
+        );
+    }
+}
+
+/// `foldl' op nul [ ]` is `nul`, which can be applied like any function.
+#[test]
+fn foldl_initial_value_is_forced() {
+    if is_skipped("foldl-thunk") {
+        return;
+    }
+    check(
+        "builtins.foldl' (x: x) (let f = a: a; in f) [ ] 1",
+        Expect::value(1),
+    );
 }
 
 /// Every evaluator has the same builtins.
