@@ -119,12 +119,7 @@ impl Evaluator {
         }
         let mut session = self.checkout();
         let out = session.eval(self.mode, expr);
-        // fix's daemon connection gets out of sync after the daemon rejects
-        // a write (see `store::store_errors_dont_poison_the_session`); start
-        // afresh rather than let that spill into other tests.
-        if matches!(&out, Outcome::Error(e) if e.contains("error: daemon:"))
-            && crate::is_skipped("store-write-desync")
-        {
+        if poisons_session(&out) {
             session.healthy = false;
         }
         let mut pool = self.pool.lock().unwrap();
@@ -296,6 +291,20 @@ pub fn eval_all(evs: &[Evaluator], expr: &str) -> Vec<Outcome> {
         let handles: Vec<_> = evs.iter().map(|ev| s.spawn(|| ev.eval(expr))).collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     })
+}
+
+/// Errors after which a known bug breaks the session (see
+/// `store::store_errors_dont_poison_the_session`). With its tag in
+/// `NIX_PBT_SKIP`, the session is restarted rather than let the bug spill
+/// into other tests.
+fn poisons_session(out: &Outcome) -> bool {
+    let Outcome::Error(e) = out else {
+        return false;
+    };
+    // fix: the daemon connection is out of sync after a rejected write.
+    (e.contains("error: daemon:") && crate::is_skipped("store-write-desync"))
+        // Lix main: the next store copy after copying a missing path segfaults.
+        || (e.contains("No such file or directory") && crate::is_skipped("failed-copy-crash"))
 }
 
 fn looks_like_crash(stderr: &str) -> bool {

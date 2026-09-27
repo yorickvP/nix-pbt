@@ -12,6 +12,9 @@
 # the command adds is new to the daemon (the closures themselves aren't
 # valid paths in its database).
 #
+# The scratch directory (the new store and state) is deleted afterwards
+# unless WITH_DAEMON_KEEP is set.
+#
 # DAEMON_CONFIG adds nix.conf lines for the daemon. The client is root in the
 # namespace, so it is trusted unless DAEMON_CONFIG sets `trusted-users =`.
 # Needs unprivileged user namespaces and util-linux.
@@ -42,7 +45,7 @@ roots=$(
 # shellcheck disable=SC2086
 nix-store -qR $roots > "$scratch/closure"
 
-exec "$util_linux/bin/unshare" --user --map-root-user --mount --fork \
+"$util_linux/bin/unshare" --user --map-root-user --mount --fork \
     env PATH="$util_linux/bin:$PATH" SCRATCH="$scratch" DAEMON="$daemon" \
     DAEMON_CONFIG="${DAEMON_CONFIG:-}" \
     bash -euo pipefail -c '
@@ -72,6 +75,11 @@ done
 
 export NIX_REMOTE=daemon XDG_CACHE_HOME="$SCRATCH/cache"
 "$@" && status=0 || status=$?
-echo "with-daemon.sh: $("$DAEMON/bin/nix-daemon" --version | head -1), scratch in $SCRATCH" >&2
+echo "with-daemon.sh: $("$DAEMON/bin/nix-daemon" --version | head -1)" >&2
 exit $status
-' with-daemon "$@"
+' with-daemon "$@" && status=0 || status=$?
+if [ -z "${WITH_DAEMON_KEEP:-}" ]; then
+    chmod -R u+w "$scratch"
+    rm -rf "$scratch"
+fi
+exit $status
