@@ -1,5 +1,5 @@
 diff --git a/src/cli/args.zig b/src/cli/args.zig
-index 68d23925..48d80358 100644
+index 68d23925..cd17d2db 100644
 --- a/src/cli/args.zig
 +++ b/src/cli/args.zig
 @@ -149,6 +149,9 @@ pub const Options = struct {
@@ -20,6 +20,15 @@ index 68d23925..48d80358 100644
      // Shell.
      packages,
      // Switch.
+@@ -495,7 +499,7 @@ const specs = [_]Spec{
+     .{ .id = .xml, .long = "--xml", .help = "write the evaluated value as XML", .show_in = value_cmds },
+     .{ .id = .no_location, .long = "--no-location", .help = "omit source positions from --xml output", .show_in = value_cmds },
+     .{ .id = .strict, .long = "--strict", .help = "recursively force values before writing", .show_in = value_cmds },
+-    .{ .id = .read_write_mode, .long = "--read-write-mode", .help = "allow eval to register derivations and sources in\nthe store", .show_in = &.{.eval} },
++    .{ .id = .read_write_mode, .long = "--read-write-mode", .help = "allow eval to register derivations and sources in\nthe store", .show_in = &.{ .eval, .repl } },
+     .{ .id = .impure, .long = "--impure", .help = "disable pure evaluation for flake installables\n(allow env, out-of-tree reads, unlocked fetches)", .show_in = selected_source_cmds },
+ 
+     .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes, coerce-integers)", .completion_help = "replace enabled experimental features", .complete = .{ .experimental_feature, .none } },
 @@ -545,6 +549,7 @@ const specs = [_]Spec{
  
      .{ .id = .no_tui, .long = "--no-tui", .help = "keep the interactive editor, but show :debug and :vm\nwithout an alternate-screen TUI", .show_in = &.{.repl} },
@@ -41,7 +50,7 @@ index 89aa27a4..3621f5a2 100644
          .nixos => options.switch_target = .nixos,
          .darwin => options.switch_target = .darwin,
 diff --git a/src/cli/repl/command.zig b/src/cli/repl/command.zig
-index 99e73b71..814f79f6 100644
+index 99e73b71..0b5c59e3 100644
 --- a/src/cli/repl/command.zig
 +++ b/src/cli/repl/command.zig
 @@ -41,6 +41,7 @@ const vm_ui = @import("vm/root.zig");
@@ -52,7 +61,25 @@ index 99e73b71..814f79f6 100644
  
  const Options = args.Options;
  const Engine = engine.Engine;
-@@ -123,7 +124,9 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
+@@ -96,6 +97,17 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
+     var session = setup.Session.init(&ev);
+     defer session.deinit(.full);
+     const term = try session.configure(init, &options, &settings);
++    // One daemon connection instead of a pool of 8 per process: the pbt
++    // server serves requests one at a time, and test suites run many.
++    if (options.pbt_server) ev.store.daemon_runtime.pool_workers = 1;
++    if (options.read_write_mode) {
++        // As in `fix eval --read-write-mode`, store writes stay on the demand
++        // path. The pbt server keeps parallelism (as `fix instantiate` does):
++        // speculative writes add paths nobody demanded, but values don't
++        // change, and that's what it's for.
++        if (!options.pbt_server) ev.setParallelismToggles(true, true);
++        ev.enableReadWriteEvaluation();
++    }
+     // The explorer is a first-class REPL surface: retain binding and synthetic
+     // lambda/node path segments for every session, not only --debugger runs.
+     ev.setCaptureChunkNames(true);
+@@ -123,7 +135,9 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
          if (tui_enabled) vm_debugger.install(&ev) else console.install(&ev);
      }
  
@@ -65,10 +92,10 @@ index 99e73b71..814f79f6 100644
          try repl.runBare(stdin_tty);
 diff --git a/src/cli/repl/pbt_server.zig b/src/cli/repl/pbt_server.zig
 new file mode 100644
-index 00000000..71f2cdee
+index 00000000..a4963172
 --- /dev/null
 +++ b/src/cli/repl/pbt_server.zig
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,65 @@
 +//! `fix repl --pbt-server`: serve the nix-pbt evaluation protocol on
 +//! stdin/stdout instead of a REPL.
 +//!
@@ -76,9 +103,10 @@ index 00000000..71f2cdee
 +//!   response: ok <byte length>\n<JSON value>
 +//!          |  error <byte length>\n<error message>
 +//!
-+//! Each expression is evaluated like `fix eval --read-write-mode --strict
-+//! --json -E`: relative paths resolve against the working directory, and
-+//! nothing is bound between requests. See https://github.com/yorickvP/nix-pbt.
++//! Each expression is evaluated like `fix eval --strict --json -E` (with
++//! `--read-write-mode` if given): relative paths resolve against the working
++//! directory, and nothing is bound between requests. See
++//! https://github.com/yorickvP/nix-pbt.
 +
 +const std = @import("std");
 +const engine = @import("expr");
@@ -91,14 +119,6 @@ index 00000000..71f2cdee
 +const collect_every = 64;
 +
 +pub fn run(allocator: std.mem.Allocator, io: std.Io, ev: *Engine, show_trace: bool) !void {
-+    // One daemon connection instead of a pool of 8 per process: requests are
-+    // served one at a time, and test suites run many servers at once.
-+    ev.store.daemon_runtime.pool_workers = 1;
-+    // Like `nix repl` (and the CppNix server): derivations and sources are
-+    // written to the store, so their paths are the real ones.
-+    ev.setParallelismToggles(true, true);
-+    ev.enableReadWriteEvaluation();
-+
 +    var stdin_buffer: [64 * 1024]u8 = undefined;
 +    var stdin = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
 +    var stdout_buffer: [64 * 1024]u8 = undefined;
