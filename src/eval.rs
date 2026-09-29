@@ -293,6 +293,11 @@ pub fn eval_all(evs: &[Evaluator], expr: &str) -> Vec<Outcome> {
     })
 }
 
+/// Evaluate `expr` with one evaluator after the other.
+pub fn eval_each(evs: &[Evaluator], expr: &str) -> Vec<Outcome> {
+    evs.iter().map(|ev| ev.eval(expr)).collect()
+}
+
 /// Errors after which a known bug breaks the session (see
 /// `store::store_errors_dont_poison_the_session`). With its tag in
 /// `NIX_PBT_SKIP`, the session is restarted rather than let the bug spill

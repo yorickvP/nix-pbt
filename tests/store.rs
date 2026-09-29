@@ -238,8 +238,311 @@ impl DrvSpec {
             builder: self.builder.clone(),
             args: self.args.iter().map(Attr::coerce).collect(),
             env,
+            fixed: None,
         })
     }
+}
+
+/// How a digest is written as `outputHash`. The model doesn't care which
+/// of these were meant to be valid: like Nix, it decides from the string.
+const HASH_ENCODINGS: &[&str] = &[
+    "base16",
+    "BASE16",
+    "nix32",
+    "base64",
+    "sri",
+    "sri-unpadded",
+    "prefixed-base16",
+    "prefixed-nix32",
+    "prefixed-base64",
+    "other-prefix",
+    "bad-char",
+    "empty",
+];
+
+const HASH_ALGOS: &[&str] = &["sha256", "sha256", "sha1", "sha512", "md5"];
+
+#[derive(Clone, Debug)]
+enum HashAlgoAttr {
+    Absent,
+    Null,
+    Str(String),
+}
+
+/// Fixed-output derivations: `outputHash` in every encoding Nix reads (and
+/// some it doesn't), with and without `outputHashAlgo` (right, wrong,
+/// unknown, empty, null, `blake3`), each `outputHashMode`, and `outputs`
+/// other than `[ "out" ]`. Nix's `newHashAllowEmpty`: an empty hash is all
+/// zeros; an `outputHashAlgo` it doesn't know counts as none; a hash with a
+/// prefix (`sha256:`, SRI `sha256-`) must agree with it.
+#[hegel::test]
+fn fixed_output_derivations(tc: TestCase) {
+    // fix main parses `outputHash` its own way.
+    if is_skipped("output-hash") {
+        return;
+    }
+    let algo = tc.draw(gs::sampled_from(HASH_ALGOS.to_vec()));
+    let size = store::hash_size(algo).unwrap();
+    let digest: Vec<u8> = (0..size).map(|_| tc.draw(gs::integers::<u8>())).collect();
+    let other = tc.draw(gs::sampled_from(vec!["md5", "sha1", "sha256", "sha512"]));
+    let hash_text = match tc.draw(gs::sampled_from(HASH_ENCODINGS.to_vec())) {
+        "base16" => store::hex(&digest),
+        "BASE16" => store::hex(&digest).to_uppercase(),
+        "nix32" => store::nix32(&digest),
+        "base64" => store::base64(&digest),
+        "sri" => format!("{algo}-{}", store::base64(&digest)),
+        "sri-unpadded" => format!("{algo}-{}", store::base64(&digest).trim_end_matches('=')),
+        "prefixed-base16" => format!("{algo}:{}", store::hex(&digest)),
+        "prefixed-nix32" => format!("{algo}:{}", store::nix32(&digest)),
+        "prefixed-base64" => format!("{algo}:{}", store::base64(&digest)),
+        "other-prefix" => format!("{other}:{}", store::hex(&digest)),
+        "bad-char" => {
+            let mut sri = format!("{algo}-{}", store::base64(&digest));
+            sri.replace_range(algo.len() + 2..algo.len() + 3, "!");
+            sri
+        }
+        _ => String::new(),
+    };
+    // Mostly what a fixed-output derivation has, sometimes the odd one out.
+    let odd = |p: f64| tc.draw(gs::weighted_booleans(p));
+    let algo_attr = if odd(0.4) {
+        match tc.draw(gs::integers::<u8>().max_value(4)) {
+            0 => HashAlgoAttr::Null,
+            1 => HashAlgoAttr::Str(String::new()),
+            2 => HashAlgoAttr::Str(other.into()),
+            _ => {
+                let mut unknown = vec!["foo", "SHA256"];
+                // Lix has no BLAKE3, so `blake3` is an unknown algorithm: none.
+                if !is_skipped("blake3") {
+                    unknown.push("blake3");
+                }
+                HashAlgoAttr::Str(tc.draw(gs::sampled_from(unknown)).into())
+            }
+        }
+    } else if odd(0.3) {
+        HashAlgoAttr::Absent
+    } else {
+        HashAlgoAttr::Str(algo.into())
+    };
+    let mut modes = vec![None, Some("flat"), Some("recursive")];
+    // Lix doesn't know `nar`, the new name of `recursive`.
+    if !is_skipped("hash-mode-nar") {
+        modes.push(Some("nar"));
+    }
+    let mode = if odd(0.15) {
+        tc.draw(gs::sampled_from(vec![
+            Some("text"),
+            Some("git"),
+            Some("Flat"),
+        ]))
+    } else {
+        tc.draw(gs::sampled_from(modes))
+    };
+    let outputs: Option<Vec<&str>> = if odd(0.1) {
+        tc.draw(gs::sampled_from(vec![
+            Some(vec!["bin"]),
+            Some(vec!["out", "dev"]),
+        ]))
+    } else {
+        tc.draw(gs::sampled_from(vec![None, Some(vec!["out"])]))
+    };
+
+    let mut fields = vec![
+        "name = \"a\";".to_string(),
+        "system = \"x\";".to_string(),
+        "builder = \"/b\";".to_string(),
+        format!("outputHash = {};", nix_string_literal(&hash_text)),
+    ];
+    let mut env = BTreeMap::from(
+        [("name", "a"), ("system", "x"), ("builder", "/b")]
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    env.insert("outputHash".into(), hash_text.clone());
+    match &algo_attr {
+        HashAlgoAttr::Absent => {}
+        HashAlgoAttr::Null => {
+            fields.push("outputHashAlgo = null;".into());
+            env.insert("outputHashAlgo".into(), String::new());
+        }
+        HashAlgoAttr::Str(s) => {
+            fields.push(format!("outputHashAlgo = {};", nix_string_literal(s)));
+            env.insert("outputHashAlgo".into(), s.clone());
+        }
+    }
+    if let Some(m) = mode {
+        fields.push(format!("outputHashMode = \"{m}\";"));
+        env.insert("outputHashMode".into(), m.into());
+    }
+    if let Some(o) = &outputs {
+        fields.push(format!(
+            "outputs = {};",
+            nix_list(o.iter().map(|o| nix_string_literal(o)))
+        ));
+        env.insert("outputs".into(), o.join(" "));
+    }
+
+    let model = || -> Result<store::DerivationPaths, String> {
+        if outputs.as_ref().is_some_and(|o| *o != ["out"]) {
+            return Err("a fixed-output derivation has one output, out".into());
+        }
+        let recursive = match mode {
+            None | Some("flat") => false,
+            Some("recursive") | Some("nar") => true,
+            Some(m) => return Err(format!("invalid outputHashMode '{m}'")),
+        };
+        let algo = match &algo_attr {
+            HashAlgoAttr::Str(s) if s == "blake3" => return Err("blake3 is experimental".into()),
+            HashAlgoAttr::Str(s) if store::hash_size(s).is_some() => Some(s.as_str()),
+            _ => None,
+        };
+        let (algo, digest) = if hash_text.is_empty() {
+            let a = algo.ok_or("empty hash requires explicit hash algorithm")?;
+            (a.to_string(), vec![0; store::hash_size(a).unwrap()])
+        } else {
+            store::parse_any_hash(&hash_text, algo)?
+        };
+        let drv = Derivation {
+            name: "a".into(),
+            outputs: vec!["out".into()],
+            platform: "x".into(),
+            builder: "/b".into(),
+            args: vec![],
+            env: env.clone(),
+            fixed: Some(store::FixedOutput {
+                recursive,
+                algo,
+                digest,
+            }),
+        };
+        tc.note(&format!("model .drv:\n{}", drv.aterm(&drv.paths().outputs)));
+        Ok(drv.paths())
+    };
+    let expect: Expect = match model() {
+        Ok(p) => Expect::value(json!([p.drv_path, p.outputs["out"]])),
+        Err(e) => {
+            tc.note(&format!("model: error: {e}"));
+            Expect::Error
+        }
+    };
+    check(
+        &format!(
+            "let d = derivation {{ {} }}; in [ d.drvPath d.outPath ]",
+            fields.join(" ")
+        ),
+        expect,
+    );
+}
+
+/// A derivation's outputs, as `derivationStrict` sees them: without
+/// structured attrs Nix coerces `outputs` to a string and splits it at
+/// whitespace (`[ "a b" ]` is outputs `a` and `b`), then rejects duplicates,
+/// `drvPath`, no outputs at all, and output paths with invalid names.
+#[hegel::test]
+fn derivation_outputs(tc: TestCase) {
+    // Known divergences leave out the names that show them (rejecting
+    // those inputs would reject most of them).
+    let mut pieces = vec!["out", "dev", "b"];
+    // fix doesn't split outputs at whitespace.
+    if !is_skipped("drv-output-split") {
+        pieces.extend(["a b", " out", "x\ty", "", "a\n"]);
+    }
+    // Lix accepts an output named `drvPath`, and has two `drvPath`s.
+    if !is_skipped("drvpath-output") {
+        pieces.push("drvPath");
+    }
+    // Read-only fix doesn't check names (the daemon does).
+    if !is_skipped("read-only-names") {
+        pieces.push("é");
+    }
+    let n = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+    let declared: Vec<&str> = (0..n)
+        .map(|_| tc.draw(gs::sampled_from(pieces.clone())))
+        .collect();
+    let tokens: Vec<String> = declared
+        .iter()
+        .flat_map(|o| o.split([' ', '\t', '\n', '\r']))
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect();
+    let model = || -> Result<Json, String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for o in &tokens {
+            if !seen.insert(o) {
+                return Err(format!("duplicate derivation output '{o}'"));
+            }
+            if o == "drvPath" {
+                return Err("invalid derivation output name 'drvPath'".into());
+            }
+        }
+        if tokens.is_empty() {
+            return Err("derivation cannot have an empty set of outputs".into());
+        }
+        for o in &tokens {
+            if o != "out" {
+                store::check_name(&format!("a-{o}"))?;
+            }
+        }
+        let env = BTreeMap::from(
+            [("name", "a"), ("system", "x"), ("builder", "/b")]
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let mut env = env;
+        env.insert("outputs".into(), declared.join(" "));
+        let drv = Derivation {
+            name: "a".into(),
+            outputs: tokens.clone(),
+            platform: "x".into(),
+            builder: "/b".into(),
+            args: vec![],
+            env,
+            fixed: None,
+        };
+        let mut names: Vec<String> = tokens.clone();
+        names.push("drvPath".into());
+        names.sort();
+        Ok(json!([drv.paths().drv_path, names]))
+    };
+    let model = model();
+    if let Err(e) = &model {
+        tc.note(&format!("model: error: {e}"));
+    }
+    let outputs = nix_list(declared.iter().map(|o| nix_string_literal(o)));
+    check(
+        &format!(
+            "let s = builtins.derivationStrict {{ name = \"a\"; system = \"x\"; builder = \"/b\"; outputs = {outputs}; }}; in [ s.drvPath (builtins.attrNames s) ]"
+        ),
+        model.clone(),
+    );
+    // `derivation.nix` makes an attribute of each declared output with
+    // `listToAttrs` (the first of equal names wins), whether the .drv has
+    // it or not, keeps `outputs` as given, and maps `all` over it.
+    let wrapper = model.map(|v| {
+        let mut names: Vec<String> = declared.iter().map(|o| o.to_string()).collect();
+        names.extend(
+            [
+                "name",
+                "system",
+                "builder",
+                "outputs",
+                "all",
+                "drvAttrs",
+                "drvPath",
+                "outPath",
+                "outputName",
+                "type",
+            ]
+            .map(String::from),
+        );
+        names.sort();
+        names.dedup();
+        json!([v[0], names, declared, declared])
+    });
+    check(
+        &format!(
+            "let d = derivation {{ name = \"a\"; system = \"x\"; builder = \"/b\"; outputs = {outputs}; }}; in [ d.drvPath (builtins.attrNames d) d.outputs (map (x: x.outputName) d.all) ]"
+        ),
+        wrapper,
+    );
 }
 
 /// `drvPath` and every output's path.
@@ -255,13 +558,15 @@ fn derivation_paths(tc: TestCase) {
         }
         Err(e) => {
             tc.note(&format!("model: error: {e}"));
-            // fix accepts an empty `system`, a `system` it can't write to
-            // the .drv, and names too long for a store path.
-            if e == "required attribute missing"
-                || e.starts_with("unparsable .drv")
-                || e.contains("longer than")
-            {
+            // fix accepts an empty `system` and names too long for a store
+            // path.
+            if e == "required attribute missing" || e.contains("longer than") {
                 skip_known(&tc, "drv-validation");
+            }
+            // CppNix writes a .drv it can't read back; evaluators that don't
+            // write it (CppNix and fix in read-only mode) give its path.
+            if e.starts_with("unparsable .drv") {
+                skip_known(&tc, "drv-unparsable");
             }
             // Read-only fix doesn't check names (the daemon does).
             if e.starts_with("illegal character") || e.contains("is not valid") {
@@ -334,6 +639,7 @@ impl StoreObj {
             builder: "/bin/sh".into(),
             args: vec![],
             env,
+            fixed: None,
         }
     }
 

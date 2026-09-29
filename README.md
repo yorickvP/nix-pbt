@@ -162,7 +162,7 @@ divergence, tests mark the inputs that trigger it with a tag, and
 | `tojson-outpath` | `builtins::*` | fix: `toJSON` of a set with a non-string `outPath` is a type error |
 | `generic-closure-operator` | `builtins::*` | fix: `genericClosure { startSet = [ ]; }` requires `operator` |
 | `foldl-thunk` | `builtins::*` | fix: `foldl' op nul [ ]` returns `nul` unforced, and applying it fails |
-| `regex` | `builtins::*` | `match`/`split` regular expressions (fix accepts some that CppNix rejects) |
+| `regex` | `builtins::*`, `regex::*` | `match`/`split` regular expressions: fix has its own (accepts some that CppNix rejects, rejects some it accepts, picks other capture groups) |
 | `fetchtree-revcount` | `fetchers::*git*` | Lix returns `revCount` from `fetchTree` (CppNix only from `fetchGit`) |
 | `tarball-top-level` | `fetchers::fetch_tarball` | Lix wants exactly one top-level entry in a tarball |
 | `fetch-path-name` | `fetchers::*path*` | fix: `fetchTree { type = "path"; }` is named after the directory, not `source` |
@@ -175,7 +175,16 @@ divergence, tests mark the inputs that trigger it with a tag, and
 | `float-to-int-range` | `arith::floor`, `arith::ceil` | fix: out-of-range results are `-9223372036854775808` |
 | `subnormal-literals` | `arith::*` | fix accepts subnormal float literals |
 | `to-string-float` | `strings::to_string_float` | fix rounds a float's shortest digits, not its exact value |
-| `drv-validation` | `store::derivation_paths` | fix accepts an empty or unwritable `system` and names too long for the store |
+| `drv-validation` | `store::derivation_paths` | fix accepts an empty `system` and names too long for the store |
+| `drv-output-split` | `store::derivation_outputs` | fix doesn't split `outputs` at whitespace (`[ "a b" ]` is outputs `a` and `b`) |
+| `output-hash` | `store::fixed_output_derivations` | fix parses `outputHash` its own way: any prefix is an algorithm (`foo-bar`), no empty hash, no `outputHashMode = "nar"`, and a nix32 hash of only hex digits is read as base-16 |
+| `drvpath-output` | `store::derivation_outputs` | Lix, like Nix 2.18, accepts an output named `drvPath`, and `derivationStrict` then returns a set with two `drvPath` attributes |
+| `hash-mode-nar` | `store::fixed_output_derivations` | Lix, like Nix 2.18, doesn't know `outputHashMode = "nar"`, newer Nix's name for `recursive` |
+| `blake3` | `store::fixed_output_derivations` | `outputHashAlgo = "blake3"`: CppNix main requires the `blake3-hashes` feature (2.31 didn't); Lix, like 2.18, doesn't know it, so it counts as no algorithm |
+| `relative-inputs` | `flakes::relative_inputs`, `flakes::subdir_flakes` | fix can't read relative inputs (`path:./sub`); Lix, like Nix 2.18, fetches one as a tree of its own instead of a part of its parent's source |
+| `flake-subdir` | `flakes::subdir_flakes` | fix: a flake in a subdirectory (`?dir=a`) has the source root as its `outPath`, not `…-source/a` |
+| `fetchtree-url-shallow` | `fetchers::fetch_git` | fix: `fetchTree "git+file:…"` has no `revCount` (it applies the attrset form's `shallow = true` default to a URL too) |
+| `drv-unparsable` | `store::derivation_paths` | CppNix and Lix write a `.drv` they can't read back for a `system` with `"` or `\`: an error in read-write mode, the path in read-only mode (fixro) |
 | `drv-output-name` | `store::derivation_*` | Lix rejects an output named `drv` |
 | `context-nonexistent` | `store::append_context_nonexistent_path` | fix accepts context for paths that don't exist |
 | `split-context` | `store::context_through_builtins` | fix: `split` drops context |
@@ -219,12 +228,13 @@ nix-shell --run 'cargo test --no-fail-fast'
 | `arith.rs` | integer ops and overflow, bit ops, float arithmetic, mixed comparisons, `floor`/`ceil`, literals | |
 | `json.rs` | `toJSON`/`fromJSON` | |
 | `versions.rs` | `splitVersion`, `compareVersions` | `libstore/names.cc` |
-| `flakes.rs` | random flake graphs with `follows`, nested overrides, `flake = false`: resolved graph vs a model of `computeLocks`; lock files from each implementation read by every other one | `functional/flakes/follow-paths.sh`, `inputs.sh`, `non-flake-inputs.sh` |
+| `regex.rs` | `match`/`split` of patterns built from the pieces where libstdc++'s `std::regex` (Nix's regular expressions) differs from POSIX and other engines: escapes, brackets, collating elements, intervals, capture groups under alternation and repetition; known answers | |
+| `flakes.rs` | random flake graphs with `follows`, nested overrides, `flake = false`: resolved graph vs a model of `computeLocks`; lock files from each implementation read by every other one; trees of flakes with relative inputs, in subdirectories (`?dir=`), in git repositories (differential: values, `outPath`s, attribute names, lock files) | `functional/flakes/follow-paths.sh`, `inputs.sh`, `non-flake-inputs.sh` |
 | `flakeref.rs` | `parseFlakeRef`/`flakeRefToString`: the unit test table, attrs round trip, canonical form is a fixed point, parsing URL-ish strings | `libflake-tests/flakeref.cc` |
-| `store.rs` | `toFile`, `placeholder`, `derivation` (exact `drvPath`/`outPath`, context), `appendContext`/`getContext` round trip, context propagation, `parseDrvName`, `hashString`, `convertHash` | `libexpr-tests/value/context.cc`, `libstore/derivations`, `names.cc` |
+| `store.rs` | `toFile`, `placeholder`, `derivation` (exact `drvPath`/`outPath`, context), fixed-output derivations (every `outputHash` encoding, `outputHashAlgo`/`outputHashMode` edge cases, against a model of `Hash::parseAny` and `makeFixedOutputPath`), `outputs` split at whitespace, `appendContext`/`getContext` round trip, context propagation, `parseDrvName`, `hashString`, `convertHash` | `libexpr-tests/value/context.cc`, `libstore/derivations`, `names.cc` |
 | `exprs.rs` | random well-typed expressions (let, lambdas, formals with defaults, `if`, `assert`, rec sets, `//`, `or`, `?`, `tryEval`, builtins) with `throw`s in lazy positions; laziness laws; error kinds (`tryEval (deepSeq e true)`) | |
 | `builtins.rs` | every builtin and operator applied to arbitrary arguments (mostly of the right type, with `throw`, failed assertions, missing `<paths>`, `abort` and type errors planted in them) inside `tryEval (deepSeq e true)`, which tells catchable errors from uncatchable ones; string context rejection; the set of builtins | |
-| `fetchers.rs` | generated "angry" file trees (every kind of byte in names, invalid UTF-8, 255-byte names, symlinks, executable bits, empty directories) through `builtins.path` (+ `filter`), `filterSource`, `fetchTree` (`path`, `git` clean and dirty, `tarball` with three layouts), `fetchTarball`, `fetchurl`, and a `readDir`/`hashFile` walk, against a model of NAR hashes and store paths; the [angryfiles](https://github.com/jakeogh/angryfiles) corpus (every one-byte name, every name length) | `libfetchers-tests`, `functional/fetchGit.sh`, `tarball.sh` |
+| `fetchers.rs` | generated "angry" file trees (every kind of byte in names, invalid UTF-8, 255-byte names, symlinks, executable bits, empty directories) through `builtins.path` (+ `filter`), `filterSource`, `fetchTree` (`path`, `git` clean and dirty and as a URL, `tarball` with three layouts), `fetchTarball`, `fetchurl`, and a `readDir`/`hashFile` walk, against a model of NAR hashes and store paths; the [angryfiles](https://github.com/jakeogh/angryfiles) corpus (every one-byte name, every name length) | `libfetchers-tests`, `functional/fetchGit.sh`, `tarball.sh` |
 
 ### Writing a property
 
@@ -298,6 +308,7 @@ against.
 | flakes | an input `path:/…/f0` in `/…/f0/flake.nix` (the flake's own directory), locked by CppNix | uses the lock file | error: NAR hash mismatch (the lock file changed the directory) |
 | `flake lock` | `inputs.a.follows = "a"`, follows to a missing input | error (`LockFile::check`) | writes the lock file |
 | `flake lock` | two inputs `b` and `c` from the same flake with an input `a` each, and `inputs.a.follows = "c"` | `b`'s is node `a`, `c`'s is `a_2` | the other way round: the same graph, but the lock file differs |
+| `fix repl` | `builtins.readFile ./f` again after `f` changed | the new contents | **the old contents**: the file cache lives as long as the session (`"${./d}"` and fetched trees are cached in `nix repl` too) |
 | `parseFlakeRef` | `"nixpkgs"`, `"flake:nixpkgs/branch"` | `{ type = "indirect"; id = "nixpkgs"; … }` | resolves through the registry to a `channels.nixos.org` tarball |
 | `parseFlakeRef` | `"github:a/b#frag"`, `"/foo/bar#bla"`, `"git+https://#"` | error: unexpected fragment / drops `#` | fragment kept in `repo`/`path`/`url` |
 | `parseFlakeRef` | `"github:foo/bar?xyzzy=1"`, `"/foo/bar?xyzzy=1"` | error: unknown parameter | ignored |
@@ -355,6 +366,76 @@ hashes and store paths of `builtins.path`, `filterSource` and `fetchTree`
 (`git` and `tarball`, read-write mode) for thousands of angry file trees
 and the angryfiles corpus.
 
+### fix: the compatibility stack
+
+A stack of 39 jj changes on fix main (`3b2ffbb2`), in the fix checkout
+next to this one, fixes the fix findings above except where fix arguably
+does better. Each change has unit tests for the cases these tests found.
+Against it, the suite passes with only these tags (`fix-stack.env`):
+
+| Tag | Why it stays |
+|---|---|
+| `error-order` | which of two errors wins depends on evaluation order |
+| `function-equality` | fix keeps `f == f` being `true`, like Lix |
+| `subnormal-literals` | fix accepts subnormal float literals; accepting more can't break code written for Nix |
+| `context-nonexistent` | Nix only checks this in read-write mode, by substituting the path; fix records `.drv`s and `toFile` outputs lazily, so a store query would reject paths fix made itself. Accepting more can't break code written for Nix |
+| `number-select` | `0.a` is a parse error, as in Lix |
+| `canonpath-signed-char`, `git-stale-mount`, `drv-unparsable` | CppNix bugs |
+
+Fixing these turned up more fix bugs, also fixed in the stack:
+
+- `unsafeDiscardOutputDependency` dropped output context;
+- a tarball without a single top-level directory was unpacked wrongly;
+- a git tree with a relative symlink crashed fix (`symLinkAbsolute`);
+- in a long-lived session, a tree fetched again after its first source was
+  deleted was read from the deleted directory;
+- regular expressions: fix's own matcher accepted patterns Nix rejects
+  (`\d`, `a{`, `[z-a]`), rejected ones it accepts (`a*?`, `a**`), picked
+  other capture groups (`(a|ab)(c|bcd)` against `abcd`) and didn't match
+  `(a*)+(b)` against `b` at all. The stack ports libstdc++'s `std::regex`,
+  which is what Nix's regular expressions are, fuzzed against it (580k
+  cases without a difference);
+- `derivation`: without structured attrs, Nix splits `outputs` at
+  whitespace; output store path names weren't checked without a daemon;
+  `outputHash` took any prefix as the algorithm (`foo-bar`), rejected an
+  empty hash and `outputHashMode = "nar"`, and `outputHashMode` wasn't
+  checked without an `outputHash`;
+- flakes, found by comparing real flakes rather than by these tests at
+  first: `fix eval --flake .#x` in a git repository used a `path:` flake,
+  where Nix uses the repository (`git+file:`, so `self` has another store
+  path and a `rev`); a flake in a subdirectory (`?dir=sub`) had the source
+  root as its `outPath`, not `…/sub`; relative inputs (`path:./sub`,
+  `./sub`) failed; `flake = false` inputs had no `sourceInfo`. All of these
+  change drvPaths of packages with `src = self`.
+  `flakes::relative_inputs` now covers relative inputs, which CppNix
+  evaluates differently depending on where the lock comes from: nodes of a
+  lock computed in the same evaluation get only the tree's store path as
+  `sourceInfo` and a normalized `outPath` (`…-source/sub`); nodes read from
+  `flake.lock` get their parent's `sourceInfo` and the path as written
+  (`…-source/./sub`).
+
+The properties added after that (`regex.rs`, fixed-output derivations,
+`outputs`, relative inputs in git repositories, subdirectory flakes) found
+more, also fixed in the stack: `outputs = [ "out" "" "" ]` is one output
+(fix rejected the duplicate `""` in the declared list, which `derivation`
+turns into attributes with `listToAttrs`); a fixed-output derivation's one
+output must be `out`; `fetchTree "git+file:…"` has a `revCount`; a git
+flake whose lock `getFlake` computed has no `rev` (Nix's `forceDirty`);
+a flake's `inputs` don't include `self`; `git+file:/x` (one slash) is a
+local repository (fix hung fetching it as a remote).
+
+The value `derivation` returns follows `derivation.nix` for declared
+outputs the `.drv` doesn't have (`[ "a b" ]`, `[ "" "out" ]`) too: they
+have attributes, whose `outPath` fails only when it's used
+(`store::derivation_outputs` checks the value).
+
+Not fixed: `readFile` in a long `fix repl` session (see the table above).
+
+With the stack, drvPaths of nixpkgs packages (`hello` to `firefox`) and of
+flakes with `src = self`, subdirectories, and relative and non-flake inputs
+are the same as CppNix's, and `fix flake lock` writes byte-identical lock
+files.
+
 ### CppNix
 
 - **Local git trees lose directories.** A directory `X` is left out of
@@ -403,6 +484,23 @@ and the angryfiles corpus.
   ≥ 2³¹ counts as a *word* and sorts before every number:
   `compareVersions "0" "2147483648" == 1`.
 - Subnormal float literals are rejected (`invalid float '5.0e-324'`).
+- A relative flake input (`path:./sub`) evaluates differently depending on
+  where its lock comes from. When `getFlake` computes the lock (there's
+  no `flake.lock`, or it's out of date), the input is an override in
+  `call-flake.nix`: its `sourceInfo` is only `{ outPath = <tree>; }` and
+  its `outPath` is normalized (`…-source/sub`). Read from `flake.lock`, it
+  has its parent's `sourceInfo` (`narHash`, `rev`, …) and the path as
+  written (`…-source/./sub`), which ends up in drv hashes with
+  `src = inputs.sub`.
+- `toXML` of a path in a flake shows the path of the local checkout
+  (`/home/…/flake/data.txt`), not of the flake's store path.
+- In the harness only: with read-write fix adding a fresh git repository
+  to the store at the same time, a long-running CppNix session sometimes
+  reads an empty `flake.nix` from it ("syntax error, unexpected end of
+  file"). Never with CppNix alone or read-only fix, not reproduced with a
+  `nix repl` and concurrent `fix eval --read-write-mode` outside the
+  harness. `check_one_at_a_time` evaluates git trees one evaluator after
+  the other.
 
 ### Lix
 
@@ -455,6 +553,14 @@ On main (2.96.0-dev):
   root overrides `f1`'s input `a` with a URL, `f1` declares
   `a.follows = "a"`. CppNix and fix use the override; Lix overflows the
   stack, in `nix flake lock` too.
+- **Two `drvPath` attributes.** An output named `drvPath` is accepted, and
+  `builtins.attrNames (builtins.derivationStrict { …; outputs = [ "drvPath" ]; })`
+  is `[ "drvPath" "drvPath" ]`. Nix 2.18 did the same; newer CppNix
+  rejects the name (`invalid derivation output name 'drvPath'`).
+- Like Nix 2.18, and unlike newer CppNix: `outputHashMode = "nar"` is
+  rejected; a relative flake input is fetched as a tree of its own, not
+  a part of its parent's source (another store path, its own `narHash`);
+  `outputHashAlgo = "blake3"` is an unknown algorithm, so it counts as none.
 
 Fixed since 2.94.2: printing invalid UTF-8 as JSON crashed Lix (fixed in
 2.95); `floor`/`ceil` of out-of-range floats returned

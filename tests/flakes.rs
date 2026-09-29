@@ -1,5 +1,6 @@
 //! Flake input resolution: random graphs of local flakes with `follows`,
-//! nested input overrides and non-flake inputs.
+//! nested input overrides and non-flake inputs, and trees of flakes with
+//! relative (`path:./x`) inputs.
 //!
 //! A property-based take on `tests/functional/flakes/follow-paths.sh`,
 //! `inputs.sh` and `non-flake-inputs.sh` from the Nix repo. The model below
@@ -657,4 +658,294 @@ fn model_matches_follow_paths_sh() {
         model(&g).unwrap(),
         "f0[B=f1[C=f2[foobar=f3[],goodoo=f3[]],foobar=f3[],goodoo=f3[]],foobar=f3[]]"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Relative inputs
+
+/// Where the flakes of a relative-input tree may live, relative to the
+/// root flake's directory (which is the first).
+const TREE_DIRS: &[&str] = &["a", "a/b", "c", "c/d"];
+
+/// `path` relative to `from` (both relative to the root; `""` is the root).
+fn relative_path(from: &str, to: &str) -> String {
+    let from: Vec<&str> = from.split('/').filter(|s| !s.is_empty()).collect();
+    let to: Vec<&str> = to.split('/').filter(|s| !s.is_empty()).collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<&str> = vec![".."; from.len() - common];
+    parts.extend(&to[common..]);
+    if parts.is_empty() || parts[0] != ".." {
+        parts.insert(0, ".");
+    }
+    parts.join("/")
+}
+
+/// Relative `path:` inputs (`path:./a`, `./a`, `path:../c`) are part of the
+/// flake that declares them: Nix locks them as declared, with a `parent`,
+/// gives them their parent's `sourceInfo`, and an `outPath` that is the
+/// parent's with the relative path appended as written. A random tree of
+/// flakes in subdirectories of one root, each with relative inputs to later
+/// ones (some `flake = false`): the evaluators agree on the resolved graph
+/// and the `outPath`s, before and after locking, and every locker writes the
+/// same lock file.
+#[hegel::test]
+fn relative_inputs(tc: TestCase) {
+    // fix main can't read relative inputs.
+    if is_skipped("relative-inputs") {
+        return;
+    }
+    let n = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+    let mut dirs = vec![String::new()];
+    for d in TREE_DIRS {
+        if dirs.len() < n && tc.draw(gs::booleans()) {
+            dirs.push(d.to_string());
+        }
+    }
+    // (flake, input name, target flake, style, flake = false)
+    let mut inputs: Vec<(usize, String, usize, u8, bool)> = Vec::new();
+    for i in 0..dirs.len() {
+        for j in i + 1..dirs.len() {
+            if tc.draw(gs::weighted_booleans(0.6)) {
+                let style = tc.draw(gs::integers::<u8>().max_value(1));
+                let non_flake = tc.draw(gs::weighted_booleans(0.2));
+                inputs.push((i, format!("i{j}"), j, style, non_flake));
+            }
+        }
+    }
+
+    // Every tree gets a fresh directory: a replay mustn't see a lock file an
+    // earlier attempt wrote, and evaluators cache a path they have read for
+    // the rest of the session, as `nix repl` does.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let write_tree = || -> PathBuf {
+        let base = tmp_dir().join(format!(
+            "nix-pbt-relative-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        for (i, dir) in dirs.iter().enumerate() {
+            let path = base.join(dir);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("data"), format!("f{i}")).unwrap();
+            let mine: Vec<&(usize, String, usize, u8, bool)> =
+                inputs.iter().filter(|x| x.0 == i).collect();
+            let decls: String = mine
+                .iter()
+                .map(|(_, name, j, style, non_flake)| {
+                    let rel = relative_path(dir, &dirs[*j]);
+                    let url = if *style == 0 {
+                        format!("path:{rel}")
+                    } else {
+                        rel
+                    };
+                    if *non_flake {
+                        format!("    {name} = {{ url = \"{url}\"; flake = false; }};\n")
+                    } else {
+                        format!("    {name}.url = \"{url}\";\n")
+                    }
+                })
+                .collect();
+            let names: Vec<String> = mine.iter().map(|x| format!("\"{}\"", x.1)).collect();
+            std::fs::write(
+                path.join("flake.nix"),
+                format!(
+                    "{{\n  inputs = {{\n{decls}  }};\n  outputs = {{ self, ... }}@inputs:\n    let v = i: if i ? value then i.value else builtins.readFile \"${{i}}/data\";\n    in {{\n      value = \"f{i}[\" + builtins.concatStringsSep \",\" (map (n: n + \"=\" + v inputs.${{n}}) [ {names} ]) + \"]\";\n      paths = map (n: builtins.unsafeDiscardStringContext inputs.${{n}}.outPath) [ {names} ];\n      paths' = map (n: inputs.${{n}}.paths or null) [ {names} ];\n      keys = map (n: builtins.attrNames inputs.${{n}}) [ {names} ];\n      sourceKeys = map (n: builtins.attrNames inputs.${{n}}.sourceInfo) [ {names} ];\n    }};\n}}\n",
+                    names = names.join(" ")
+                ),
+            )
+            .unwrap();
+        }
+        unique_tree(&base);
+        base
+    };
+    tc.note(&format!(
+        "flakes: {dirs:?}\ninputs (flake, name, target, path:, flake = false): {inputs:?}"
+    ));
+    let expr = |url: String| {
+        format!(
+            "let f = builtins.getFlake \"{url}\"; in [ f.value f.paths f.paths' f.keys f.sourceKeys (builtins.attrNames f) ]"
+        )
+    };
+
+    // Without a lock file, Nix locks in memory. In a git repository, the
+    // root's source has a `rev` (and so on).
+    let base = write_tree();
+    if tc.draw(gs::weighted_booleans(0.3)) {
+        git_commit(&base);
+        check_one_at_a_time(
+            &expr(format!("git+file://{}", base.display())),
+            Expect::Unspecified,
+        );
+    } else {
+        check(
+            &expr(format!("path:{}", base.display())),
+            Expect::Unspecified,
+        );
+    }
+    let _ = std::fs::remove_dir_all(&base);
+
+    let mut locks: Vec<(String, serde_json::Value)> = Vec::new();
+    for locker in commands("NIX_PBT_FLAKE_LOCK") {
+        let base = write_tree();
+        let (ok, stderr) = locker.run_in(&base);
+        assert!(ok, "{} failed to lock:\n{stderr}", locker.name);
+        let json = match std::fs::read_to_string(base.join("flake.lock")) {
+            Ok(text) => {
+                tc.note(&format!("lock file by {}:\n{text}", locker.name));
+                serde_json::from_str(&text).unwrap()
+            }
+            Err(_) => serde_json::Value::Null,
+        };
+        check(
+            &expr(format!("path:{}", base.display())),
+            Expect::Unspecified,
+        );
+        locks.push((locker.name.clone(), json));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    for (name, lock) in &locks[1.min(locks.len())..] {
+        assert_eq!(
+            lock, &locks[0].1,
+            "lock file by {name} differs from the one by {}",
+            locks[0].0
+        );
+    }
+}
+
+/// Flakes in subdirectories of a tree (`?dir=`): a flake's `outPath` is its
+/// source's with the directory appended (`path:/x?dir=a` is
+/// `…-source/a`), `sourceInfo.outPath` is the source's, and the same goes
+/// for an input with `?dir=`. The root is one of the flakes, its inputs
+/// relative or absolute; the tree is sometimes a git repository
+/// (`git+file:`).
+#[hegel::test]
+fn subdir_flakes(tc: TestCase) {
+    // fix main gives a flake in a subdirectory the source root as its
+    // `outPath`.
+    if is_skipped("flake-subdir") {
+        return;
+    }
+    let mut dirs: Vec<&str> = Vec::new();
+    for d in ["a", "", "a/b", "c"] {
+        if dirs.len() < 3 && tc.draw(gs::booleans()) {
+            dirs.push(d);
+        }
+    }
+    if dirs.is_empty() {
+        dirs.push("a");
+    }
+    let git = tc.draw(gs::weighted_booleans(0.3));
+    // (flake, target, relative)
+    let mut inputs: Vec<(usize, usize, bool)> = Vec::new();
+    for i in 0..dirs.len() {
+        for j in i + 1..dirs.len() {
+            if tc.draw(gs::weighted_booleans(0.7)) {
+                // Lix can't do relative inputs as Nix does now.
+                let relative = !is_skipped("relative-inputs") && tc.draw(gs::booleans());
+                inputs.push((i, j, relative));
+            }
+        }
+    }
+    tc.note(&format!(
+        "flakes: {dirs:?}, git: {git}, inputs (flake, target, relative): {inputs:?}"
+    ));
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let base = tmp_dir().join(format!(
+        "nix-pbt-subdir-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let flake_ref = |d: &str| {
+        let scheme = if git { "git+file://" } else { "path:" };
+        if d.is_empty() {
+            format!("{scheme}{}", base.display())
+        } else {
+            format!("{scheme}{}?dir={d}", base.display())
+        }
+    };
+    for (i, dir) in dirs.iter().enumerate() {
+        let path = base.join(dir);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("data"), format!("f{i}")).unwrap();
+        let mine: Vec<&(usize, usize, bool)> = inputs.iter().filter(|x| x.0 == i).collect();
+        let decls: String = mine
+            .iter()
+            .map(|(_, j, relative)| {
+                let url = if *relative {
+                    relative_path(dir, dirs[*j])
+                } else {
+                    flake_ref(dirs[*j])
+                };
+                format!("    i{j}.url = \"{url}\";\n")
+            })
+            .collect();
+        let names: Vec<String> = mine.iter().map(|x| format!("\"i{}\"", x.1)).collect();
+        std::fs::write(
+            path.join("flake.nix"),
+            format!(
+                "{{\n  inputs = {{\n{decls}  }};\n  outputs = {{ self, ... }}@inputs: {{\n    value = \"f{i}[\" + builtins.concatStringsSep \",\" (map (n: n + \"=\" + inputs.${{n}}.value) [ {names} ]) + \"]\";\n    self = builtins.unsafeDiscardStringContext self.outPath;\n    src = builtins.unsafeDiscardStringContext self.sourceInfo.outPath;\n    data = builtins.readFile ./data;\n    ins = map (n: [ inputs.${{n}}.self inputs.${{n}}.src inputs.${{n}}.data ]) [ {names} ];\n  }};\n}}\n",
+                names = names.join(" ")
+            ),
+        )
+        .unwrap();
+    }
+    unique_tree(&base);
+    let expr = format!(
+        "let f = builtins.getFlake \"{}\"; in [ f.value f.self f.src f.data f.ins (builtins.attrNames f) (builtins.attrNames f.inputs) ]",
+        flake_ref(dirs[0])
+    );
+    if git {
+        git_commit(&base);
+        check_one_at_a_time(&expr, Expect::Unspecified);
+    } else {
+        check(&expr, Expect::Unspecified);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A file of its own in every tree: CppNix reads a fetched tree (or git
+/// revision) from the directory it first read it from, even after that one
+/// is gone (see `fetchers::stale_git_mount`), so no two test cases may have
+/// the same tree.
+fn unique_tree(dir: &Path) {
+    std::fs::write(dir.join("nix-pbt-id"), dir.display().to_string()).unwrap();
+}
+
+/// Commit everything in `dir` to a new git repository.
+fn git_commit(dir: &Path) {
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["add", "-A"],
+        &["commit", "-q", "-m", "m"],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "a")
+            .env("GIT_AUTHOR_EMAIL", "a@a")
+            .env("GIT_COMMITTER_NAME", "a")
+            .env("GIT_COMMITTER_EMAIL", "a@a")
+            .env("GIT_AUTHOR_DATE", "@1700000000 +0000")
+            .env("GIT_COMMITTER_DATE", "@1700000000 +0000")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn relative_paths_between_tree_dirs() {
+    assert_eq!(relative_path("", "a"), "./a");
+    assert_eq!(relative_path("", "a/b"), "./a/b");
+    assert_eq!(relative_path("a", "a/b"), "./b");
+    assert_eq!(relative_path("a/b", "c"), "../../c");
+    assert_eq!(relative_path("a", "c/d"), "../c/d");
 }

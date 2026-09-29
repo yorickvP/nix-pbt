@@ -56,9 +56,22 @@ impl<T: Into<Json>, E> From<Result<T, E>> for Expect {
 /// evaluator's outcome if anything is off. Otherwise returns the reference
 /// evaluator's outcome, for properties that build on it.
 pub fn check(expr: &str, expect: impl Into<Expect>) -> Outcome {
-    let expect = expect.into();
+    check_with(expr, expect.into(), eval::eval_all)
+}
+
+/// [`check`], with the evaluators running one after the other.
+///
+/// For fresh git repositories: while read-write fix adds a tree to the store
+/// at the same time, a long-running CppNix session sometimes reads an empty
+/// `flake.nix` from it ("syntax error, unexpected end of file"). Not
+/// reproduced outside the harness yet.
+pub fn check_one_at_a_time(expr: &str, expect: impl Into<Expect>) -> Outcome {
+    check_with(expr, expect.into(), eval::eval_each)
+}
+
+fn check_with(expr: &str, expect: Expect, eval: fn(&[Evaluator], &str) -> Vec<Outcome>) -> Outcome {
     let evs = evaluators();
-    let outcomes = eval::eval_all(evs, expr);
+    let outcomes = eval(evs, expr);
     log(evs, expr, &outcomes);
 
     let mut problems = Vec::new();

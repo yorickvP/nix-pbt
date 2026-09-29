@@ -593,6 +593,15 @@ fn check_git(scratch: &Scratch, tree: &Tree, dirty: bool) {
         ),
         Expect::Unspecified,
     );
+    // A URL string doesn't get the attrset's `shallow = true` default, so
+    // it has a `revCount` (in a clean tree).
+    if !is_skipped("fetchtree-url-shallow") {
+        let url_ref = nix_string_literal(&format!("git+file://{}", repo.display()));
+        check(
+            &format!("builtins.attrNames (builtins.fetchTree {url_ref})"),
+            Expect::Unspecified,
+        );
+    }
     check(
         &format!(
             "{WALK} (builtins.fetchTree {{ type = \"git\"; url = {url}; }}).outPath \"directory\""

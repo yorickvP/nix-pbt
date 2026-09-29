@@ -648,6 +648,15 @@ const NO_CONTEXT: &[&str] = &[
     "builtins.compareVersions \"1\" C",
     "builtins.splitVersion C",
     "builtins.appendContext \"\" { \"${builtins.toFile \"d\" \"\"}\" = { outputs = [ C ]; }; }",
+    // Attribute names built, selected or tested.
+    "{ ${C} = 1; }",
+    "{ a = 1; }.${C} or 2",
+    "{ a = 1; } ? ${C}",
+    "builtins.convertHash { hash = C; hashAlgo = \"sha256\"; toHashFormat = \"sri\"; }",
+    "builtins.convertHash { hash = \"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"; toHashFormat = C; }",
+    "(derivation { name = \"a\"; system = \"x\"; builder = \"/b\"; __structuredAttrs = true; outputs = [ C ]; }).drvPath",
+    "(derivation { name = \"a\"; system = \"x\"; builder = \"/b\"; __structuredAttrs = true; outputHash = \"\"; outputHashAlgo = \"sha256\"; outputHashMode = C; }).drvPath",
+    "builtins.parseFlakeRef C",
 ];
 
 /// Strings with each kind of context, to put in `C`.
